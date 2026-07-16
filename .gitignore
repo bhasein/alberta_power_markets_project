@@ -1,0 +1,31 @@
+# Local Python environments
+venv/
+.venv/
+env/
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project datasets and generated artifacts
+data/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
