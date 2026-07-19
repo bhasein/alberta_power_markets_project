@@ -24,6 +24,7 @@ PIPELINE OVERVIEW:
 ================================================================================
 """
 
+# Imports
 from pathlib import Path
 import argparse
 import pandas as pd
@@ -95,6 +96,8 @@ def load_raw_intertie_file(
         single validated way to load each historical source table before
         the files are standardized and combined.
     """
+    # Raise an error if the raw source file is missing, 
+    # pipeline cannot execute otherwise. 
     if not raw_file.exists():
         raise FileNotFoundError(f"Missing raw intertie file: {raw_file}")
 
@@ -116,31 +119,45 @@ def clean_one_intertie_file(
         source table into the same schema so clean_interties() can safely
         concatenate files from different time periods.
     """
+
+    # Create copy of raw file, 
+    # work is done on the copy. 
     raw = raw.copy()
 
+    # Strip whitespace, handle \ufeff formatting for the raw column names. 
     raw.columns = (
         raw.columns
         .str.strip()
         .str.replace("\ufeff", "", regex=False)
     )
 
+    # Create set of required columns. 
     required_raw_columns = {"Date_Begin_GMT"} | set(RAW_COLUMN_MAP.keys())
 
+    # Calculate and print - if any - missing columns. 
+    # Missing columns are calculated using the set of the columns in the copy of the raw dataset. 
     missing = required_raw_columns - set(raw.columns)
     if missing:
         raise ValueError(f"Missing raw columns in {source_file.name}: {missing}")
 
+    # Create new pandas dataframe. 
     out = pd.DataFrame()
 
+    # Create timestamp column - a datetime object version of the source
+    # files Date_Begin_GMT column. 
     out["timestamp_utc"] = pd.to_datetime(
         raw["Date_Begin_GMT"],
         errors="coerce",
         utc=True,
     )
 
+    # Loop through the key: value pairs from the RAW_COLUMN_MAP dictionary, 
+    # create columns using the clean_col naming convention, and assign values 
+    # from the copy of the source file. 
     for raw_col, clean_col in RAW_COLUMN_MAP.items():
         out[clean_col] = pd.to_numeric(raw[raw_col], errors="coerce")
 
+    # Record which source file each row came from. 
     out["source_file"] = source_file.name
 
     return out
@@ -159,8 +176,11 @@ def clean_interties(
         hourly table consumed by audit_interties(), keeping the last record
         when source files overlap on the same timestamp.
     """
+    # Empty list to store the cleaned dataframes. 
     frames = []
 
+    # Loop through the raw files, load and clean each, 
+    # before appending the result to the empty frames list. 
     for raw_file in raw_files:
         raw = load_raw_intertie_file(raw_file)
         clean = clean_one_intertie_file(raw, raw_file)
@@ -168,11 +188,17 @@ def clean_interties(
 
     out = pd.concat(frames, ignore_index=True)
 
+    # Drop missing timestamps. 
+    # Sort by timestamp. 
     out = out.dropna(subset=["timestamp_utc"])
     out = out.sort_values("timestamp_utc").reset_index(drop=True)
 
+    # Calculate the number of duplicate timestamps. 
     duplicate_count = int(out["timestamp_utc"].duplicated().sum())
 
+    # If there are duplicates, handle the issue by keeping the last
+    # of the duplicate, and dropping the leading duplicates. 
+    # Reset the index, dropping the old index values. 
     if duplicate_count > 0:
         out = (
             out
@@ -181,8 +207,11 @@ def clean_interties(
             .reset_index(drop=True)
         )
 
+    # Drop the source file column. 
     out = out.drop(columns=["source_file"])
 
+    # loc[rows, columns]. The first : means "keep all rows",
+    # the next column means keep the first instances of each column name. 
     return out.loc[:, ~out.columns.duplicated()]
 
 
@@ -435,12 +464,19 @@ def print_audit_report(
         or the pass/fail result; it exposes the findings from
         audit_interties() for manual review.
     """
+
+    # Recalculate audit result based only on audits with an error-level severity. 
+    # Warnings and informational checks are ignored here. 
     audit_pass = audit_df.loc[audit_df["severity"] == "error", "pass"].all()
+    # Select every failed audit check, regardless of severity level. 
     failed = audit_df.loc[~audit_df["pass"]]
 
+    # Convert the cleaned timestamp datetime object into a DatetimeIndex for time-range and coverage calculations. 
+    # The expected hours are calculated by the length of the number of hours between the minimum and maximum. 
     ts = pd.DatetimeIndex(pd.to_datetime(clean["timestamp_utc"], utc=True))
     expected_hours = len(pd.date_range(ts.min(), ts.max(), freq="h", tz="UTC"))
 
+    # Formating. 
     print("\n" + "=" * 80)
     print("INTERTIES / HOUR-AHEAD AUDIT")
     print("=" * 80)
@@ -453,16 +489,19 @@ def print_audit_report(
     print(f"Expected hrs  : {expected_hours:,}")
     print(f"Coverage      : {len(clean) / expected_hours:.2%}")
 
+    # Print out a structured message if any of the audit checks fail. 
     print("\nFailed checks:")
     if failed.empty:
         print("  None")
     else:
+        # The underscore ignored the DataFrame row index returned by iterrows().
         for _, row in failed.iterrows():
             print(
                 f"  - {row['check']} [{row['severity']}] "
                 f"observed={row['observed']} expected={row['expected']}"
             )
 
+    # Print out a structured message of the passed/failed attempts
     print("\nAudit checklist:")
     for _, row in audit_df.iterrows():
         icon = "✓" if row["pass"] else "✗"
@@ -470,6 +509,7 @@ def print_audit_report(
         check = row["check"]
         print(f"  {icon} {check} ({sev})")
 
+    # Build a smaller feature-summary table for terminal display. 
     print("\nFeature statistics:")
     compact = feature_summary[
         ["feature", "missing_count", "mean", "median", "p01", "p99", "min", "max"]
@@ -477,6 +517,9 @@ def print_audit_report(
 
     compact = compact.rename(columns={"missing_count": "missing"})
 
+    # Round selected numeric statistics to two decimal places
+    # for easier terminal reading. 
+    # This modified only the compact copy, not the feature_summary. 
     for col in ["mean", "median", "p01", "p99", "min", "max"]:
         compact[col] = compact[col].round(2)
 

@@ -73,12 +73,11 @@ python src/feature_engineering/calendar_features.py \
     --write-csv
 """
 
+# Imports
 from __future__ import annotations
-
 import argparse
 import time
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
@@ -95,44 +94,17 @@ except ImportError as exc:
 # Paths
 # ============================================================================
 
-PROJECT_ROOT = Path(
-    "/Users/brodiehasein/alberta_power_markets_project"
-)
+PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
 
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "data/features/calendar"
-)
+OUTPUT_DIR = (PROJECT_ROOT/ "data/features/calendar")
+OUTPUT_PARQUET = (OUTPUT_DIR/ "calendar_features_hourly.parquet")
+OUTPUT_CSV = (OUTPUT_DIR/ "calendar_features_hourly.csv")
 
-OUTPUT_PARQUET = (
-    OUTPUT_DIR
-    / "calendar_features_hourly.parquet"
-)
+AUDIT_DIR = (PROJECT_ROOT/ "data/audits")
+AUDIT_FILE = (AUDIT_DIR/ "calendar_features_audit_checks.csv")
+SUMMARY_FILE = (AUDIT_DIR/ "calendar_features_summary.csv")
 
-OUTPUT_CSV = (
-    OUTPUT_DIR
-    / "calendar_features_hourly.csv"
-)
-
-AUDIT_DIR = (
-    PROJECT_ROOT
-    / "data/audits"
-)
-
-AUDIT_FILE = (
-    AUDIT_DIR
-    / "calendar_features_audit_checks.csv"
-)
-
-SUMMARY_FILE = (
-    AUDIT_DIR
-    / "calendar_features_summary.csv"
-)
-
-HOLIDAY_DATES_FILE = (
-    AUDIT_DIR
-    / "calendar_holiday_dates.csv"
-)
+HOLIDAY_DATES_FILE = (AUDIT_DIR/ "calendar_holiday_dates.csv")
 
 
 # ============================================================================
@@ -217,51 +189,55 @@ def add_check(
     )
 
 
-def parse_utc_timestamp(
-    value: str | pd.Timestamp,
-    field_name: str,
-) -> pd.Timestamp:
+def parse_utc_timestamp(value: str | pd.Timestamp,field_name: str,) -> pd.Timestamp:
     """Parse a timezone-aware UTC timestamp."""
 
+    # Convert the input value to a pandas Timestamp object.  
     timestamp = pd.Timestamp(value)
 
+    # Verify that the timestamp includes timezone information.
+    # Raise an error if the timestamp is timezone-naive. 
     if timestamp.tzinfo is None:
         raise ValueError(
             f"{field_name} must include timezone information. "
             f"Example: 2015-01-01 00:00:00+00:00"
         )
 
+    # Convert the timestamp to UTC and return it. 
     return timestamp.tz_convert("UTC")
 
 
-def validate_range(
-    start_utc: pd.Timestamp,
-    end_utc: pd.Timestamp,
-) -> None:
+def validate_range(start_utc: pd.Timestamp, end_utc: pd.Timestamp,) -> None:
     """Validate requested calendar coverage."""
 
+    # Verify that the timestamps have a start and end date in the correct order, 
+    # otherwise print an error message.
     if end_utc < start_utc:
         raise ValueError(
             f"End timestamp must be on or after start timestamp. "
             f"Observed start={start_utc}, end={end_utc}"
         )
 
+    # Verify that the first minute, and first second of the first timestamp are 0. 
+    # Otherwise print an error message. 
     if start_utc.minute != 0 or start_utc.second != 0:
         raise ValueError(
             f"Start timestamp must be aligned to the hour: {start_utc}"
         )
 
+    # Verify that the last minute, and last second of the last hour end in 0. 
+    # Otherwise print an error message. 
     if end_utc.minute != 0 or end_utc.second != 0:
         raise ValueError(
             f"End timestamp must be aligned to the hour: {end_utc}"
         )
 
 
-def meteorological_season(
-    month: pd.Series,
-) -> pd.Series:
+def meteorological_season(month: pd.Series,) -> pd.Series:
     """Map month numbers to meteorological seasons."""
 
+    # Create a list of boolean masks, one for each meterological season. 
+    # Each mask identifies which rows belong to that season. 
     conditions = [
         month.isin([12, 1, 2]),
         month.isin([3, 4, 5]),
@@ -269,6 +245,7 @@ def meteorological_season(
         month.isin([9, 10, 11]),
     ]
 
+    # Define the season assigned when the corresponding condition is True. 
     choices = [
         "winter",
         "spring",
@@ -276,7 +253,10 @@ def meteorological_season(
         "fall",
     ]
 
+    # Create a Series containing the season for each month. 
+    # If a month does not match any condition, assign 'unkown'. 
     return pd.Series(
+        # np.select() essentially is doing 'if condition 1 --> 'winter', if conditional 2 --> 'spring'".
         np.select(
             conditions,
             choices,
@@ -287,11 +267,11 @@ def meteorological_season(
     )
 
 
-def period_of_day(
-    hour: pd.Series,
-) -> pd.Series:
+def period_of_day(hour: pd.Series,) -> pd.Series:
     """Create one mutually exclusive period-of-day category."""
 
+    # Create a list of boolean masks, one for each period of the day. 
+    # Each mask identifies which row belongs to that period. 
     conditions = [
         hour.between(0, 5),
         hour.between(6, 9),
@@ -300,6 +280,7 @@ def period_of_day(
         hour.between(20, 23),
     ]
 
+    # Define the period assigned.  
     choices = [
         "overnight",
         "morning_ramp",
@@ -308,6 +289,9 @@ def period_of_day(
         "late_evening",
     ]
 
+    # Return the pandas series, 
+    # np.select assigns each condition to its corresponding choice. 
+    # The default value is set to 'unknown'. 
     return pd.Series(
         np.select(
             conditions,
@@ -323,32 +307,34 @@ def period_of_day(
 # Holiday construction
 # ============================================================================
 
-def build_alberta_holiday_table(
-    local_dates: pd.Series,
-) -> pd.DataFrame:
+def build_alberta_holiday_table(local_dates: pd.Series,) -> pd.DataFrame:
     """
     Build one row per Alberta holiday date required by the dataset.
 
     The `holidays` package includes observed holiday dates where applicable.
     """
 
+    # Determine the earliest year represented in the input dates. 
     minimum_year = int(
         local_dates.dt.year.min()
     )
 
+    # Determine the latest year represented in the input datas. 
     maximum_year = int(
         local_dates.dt.year.max()
     )
 
+    # Create an Alberta holiday calendar covering the required years.
+    # Include one year before and after the data range to safely capture
+    # holidays near the dataset boundaries.
     holiday_calendar = holidays.CA(
         subdiv="AB",
-        years=range(
-            minimum_year - 1,
-            maximum_year + 2,
-        ),
+        years=range(minimum_year - 1, maximum_year + 2,),
         observed=True,
     )
 
+    # Build a list of dictionaries, one for each holiday in the calendar.
+    # Each dictionary stores the holiday date and its corresponding name.
     rows = [
         {
             "local_date": pd.Timestamp(date_value),
@@ -359,8 +345,10 @@ def build_alberta_holiday_table(
         )
     ]
 
+    # Convert the list of holiday records into a dataframe. 
     holiday_table = pd.DataFrame(rows)
 
+    # Return an empty DataFrame with the expected schema if no holidays exist.
     if holiday_table.empty:
         return pd.DataFrame(
             columns=[
@@ -369,30 +357,21 @@ def build_alberta_holiday_table(
             ]
         )
 
+    # Create a local date column, which uses the datetime version of the local_date column. 
     holiday_table["local_date"] = pd.to_datetime(
         holiday_table["local_date"]
     )
 
-    # A date can occasionally receive multiple holiday labels.
+    # Some dates can have multiple holiday names (for example, an observed
+    # holiday occurring on the same day as another holiday).
+    # Group rows by date, combine duplicate holiday names, sort them
+    # alphabetically, and join them into a single string separated by " | ".
     holiday_table = (
-        holiday_table
-        .groupby(
-            "local_date",
-            as_index=False,
-        )["holiday_name"]
-        .agg(
-            lambda values: " | ".join(
-                sorted(
-                    set(values)
-                )
-            )
-        )
-        .sort_values(
-            "local_date"
-        )
-        .reset_index(
-            drop=True
-        )
+        holiday_table.groupby("local_date",as_index=False,)["holiday_name"]
+        # .agg() is like "aggregating" the holiday names that share the same date. 
+        .agg(lambda values: " | ".join(sorted(set(values))))
+        .sort_values("local_date")
+        .reset_index(drop=True)
     )
 
     return holiday_table
@@ -402,17 +381,15 @@ def build_alberta_holiday_table(
 # Feature construction
 # ============================================================================
 
-def build_calendar_features(
-    start_utc: pd.Timestamp,
-    end_utc: pd.Timestamp,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_calendar_features(start_utc: pd.Timestamp,end_utc: pd.Timestamp,) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build the complete hourly calendar feature table."""
 
-    validate_range(
-        start_utc,
-        end_utc,
-    )
+    # Verify that the input timestamp range is valid before
+    # generating the calendar features. 
+    validate_range(start_utc, end_utc,)
 
+    # Create an hourly UTC DatetimeIndex covering the entire
+    # requested time range, including both start and end timestamps. 
     timestamp_utc = pd.date_range(
         start=start_utc,
         end=end_utc,
@@ -420,19 +397,21 @@ def build_calendar_features(
         tz="UTC",
     )
 
+    # Create the calendar DataFrame using the hourly UTC timestamps. 
     calendar = pd.DataFrame(
         {
             "timestamp_utc": timestamp_utc,
         }
     )
 
+    # Convert the utc timezone to the local timezone. 
+    # Calendar features depend on local time. 
     timestamp_local = (
         calendar["timestamp_utc"]
-        .dt.tz_convert(
-            TIMEZONE
-        )
+        .dt.tz_convert(TIMEZONE)
     )
 
+    # Create albeta timestamp column. 
     calendar["timestamp_alberta"] = (
         timestamp_local
     )
@@ -504,6 +483,7 @@ def build_calendar_features(
         .astype("string")
     )
 
+    # Intraday.
     calendar["hour_alberta"] = (
         timestamp_local
         .dt.hour
@@ -512,25 +492,13 @@ def build_calendar_features(
 
     calendar["utc_offset_hours"] = (
         timestamp_local
-        .map(
-            lambda value: (
-                value.utcoffset()
-                .total_seconds()
-                / 3600.0
-            )
-        )
-        .astype("int8")
+        .map(lambda value: (value.utcoffset().total_seconds() / 3600.0)).
+        astype("int8")
     )
 
     calendar["is_daylight_saving_time"] = (
         timestamp_local
-        .map(
-            lambda value: (
-                value.dst()
-                .total_seconds()
-                != 0
-            )
-        )
+        .map(lambda value: (value.dst().total_seconds()!= 0))
         .astype("int8")
     )
 
@@ -539,21 +507,13 @@ def build_calendar_features(
     # ------------------------------------------------------------------------
 
     calendar["is_weekday"] = (
-        calendar[
-            "day_of_week_alberta"
-        ]
-        .between(
-            0,
-            4,
-        )
+        calendar["day_of_week_alberta"]
+        .between(0, 4)
         .astype("int8")
     )
 
     calendar["is_weekend"] = (
-        (
-            1
-            - calendar["is_weekday"]
-        )
+        (1 - calendar["is_weekday"])
         .astype("int8")
     )
 
@@ -598,75 +558,48 @@ def build_calendar_features(
     # ------------------------------------------------------------------------
 
     holiday_table = (
-        build_alberta_holiday_table(
-            calendar["local_date"]
-        )
+        build_alberta_holiday_table(calendar["local_date"])
     )
 
     holiday_name_map = (
         holiday_table
-        .set_index(
-            "local_date"
-        )["holiday_name"]
+        .set_index("local_date")["holiday_name"]
         .to_dict()
     )
 
     holiday_dates = set(
-        holiday_table[
-            "local_date"
-        ]
+        holiday_table["local_date"]
     )
 
     calendar["holiday_name"] = (
         calendar["local_date"]
-        .map(
-            holiday_name_map
-        )
+        .map(holiday_name_map)
         .fillna("")
         .astype("string")
     )
 
+    # Holiday effects. 
     calendar["is_holiday"] = (
-        calendar[
-            "local_date"
-        ]
-        .isin(
-            holiday_dates
-        )
+        calendar["local_date"]
+        .isin(holiday_dates)
         .astype("int8")
     )
 
     calendar["is_day_before_holiday"] = (
-        (
-            calendar["local_date"]
-            + pd.Timedelta(
-                days=1
-            )
-        )
-        .isin(
-            holiday_dates
-        )
+        (calendar["local_date"] + pd.Timedelta(days=1))
+        .isin(holiday_dates)
         .astype("int8")
     )
 
     calendar["is_day_after_holiday"] = (
-        (
-            calendar["local_date"]
-            - pd.Timedelta(
-                days=1
-            )
-        )
-        .isin(
-            holiday_dates
-        )
+        (calendar["local_date"]- pd.Timedelta(days=1))
+        .isin(holiday_dates)
         .astype("int8")
     )
 
+    # Commercial/industrial hours. 
     calendar["is_business_day"] = (
-        (
-            calendar["is_weekday"].eq(1)
-            & calendar["is_holiday"].eq(0)
-        )
+        (calendar["is_weekday"].eq(1)& calendar["is_holiday"].eq(0))
         .astype("int8")
     )
 
@@ -674,109 +607,56 @@ def build_calendar_features(
     # Season and operating-period features
     # ------------------------------------------------------------------------
 
-    calendar["season"] = (
-        meteorological_season(
-            calendar[
-                "month_alberta"
-            ]
-        )
-    )
+    calendar["season"] = (meteorological_season(calendar["month_alberta"]))
 
+    # Rough weather-driven demand regime proxies 
+    # (both heating and cooling).
     calendar["is_heating_season"] = (
-        calendar[
-            "month_alberta"
-        ]
-        .isin(
-            [
-                10,
-                11,
-                12,
-                1,
-                2,
-                3,
-                4,
-            ]
-        )
+        calendar["month_alberta"]
+        .isin([10, 11, 12, 1, 2, 3, 4])
         .astype("int8")
     )
 
     calendar["is_cooling_season"] = (
-        calendar[
-            "month_alberta"
-        ]
-        .isin(
-            [
-                6,
-                7,
-                8,
-            ]
-        )
+        calendar["month_alberta"]
+        .isin([6, 7, 8])
         .astype("int8")
     )
 
-    hour = calendar[
-        "hour_alberta"
-    ]
+    hour = calendar["hour_alberta"]
 
-    calendar["period_of_day"] = (
-        period_of_day(
-            hour
-        )
-    )
+    calendar["period_of_day"] = (period_of_day(hour))
 
+    # Overnight hours. 
     calendar["is_overnight"] = (
-        hour
-        .between(
-            0,
-            5,
-        )
+        hour.between(0,5)
         .astype("int8")
     )
 
+    # Price, scarcity behaviour may differ during ramp hours. 
     calendar["is_morning_ramp"] = (
-        hour
-        .between(
-            6,
-            9,
-        )
+        hour.between(6,9)
         .astype("int8")
     )
 
     calendar["is_business_hour"] = (
-        (
-            calendar["is_business_day"].eq(1)
-            & hour.between(
-                8,
-                16,
-            )
-        )
+        (calendar["is_business_day"]
+        .eq(1)& hour.between(8,16))
         .astype("int8")
     )
 
     calendar["is_afternoon"] = (
-        hour
-        .between(
-            12,
-            16,
-        )
+        hour.between(12, 16)
         .astype("int8")
     )
 
     calendar["is_evening_peak"] = (
-        hour
-        .between(
-            17,
-            20,
-        )
+        hour.between(17,20,)
         .astype("int8")
     )
 
     calendar["is_late_evening"] = (
-        hour
-        .between(
-            21,
-            23,
-        )
+        hour.between(21, 23)
         .astype("int8")
     )
 
@@ -784,74 +664,31 @@ def build_calendar_features(
     # Cyclical encodings
     # ------------------------------------------------------------------------
 
-    calendar["hour_sin"] = np.sin(
-        2.0
-        * np.pi
-        * calendar["hour_alberta"]
-        / 24.0
-    )
+    """
+    Cyclical encodings are a way of representing values that wrap around. 
+    Mathematically hours 23:00 and 00:00 differ by 23 hours, but in reality they are one hour apart. 
+    Placing hours around a circle allows 11pm and 12am to sit next to eachother, almost like a clock. 
 
-    calendar["hour_cos"] = np.cos(
-        2.0
-        * np.pi
-        * calendar["hour_alberta"]
-        / 24.0
-    )
+    This can be done with hours, months, etc. 
+    In power forecasting, electricity demand follws repeated cycles. 
 
-    calendar["day_of_week_sin"] = np.sin(
-        2.0
-        * np.pi
-        * calendar["day_of_week_alberta"]
-        / 7.0
-    )
+    This is why some features may be more predictive at t-24 hours than t-18 hours. 
+    """
 
-    calendar["day_of_week_cos"] = np.cos(
-        2.0
-        * np.pi
-        * calendar["day_of_week_alberta"]
-        / 7.0
-    )
+    TWO_PI = 2.0 * np.pi
 
-    calendar["month_sin"] = np.sin(
-        2.0
-        * np.pi
-        * (
-            calendar["month_alberta"]
-            - 1
-        )
-        / 12.0
-    )
+    calendar["hour_sin"] = np.sin(TWO_PI * calendar["hour_alberta"] / 24.0)
+    calendar["hour_cos"] = np.cos(TWO_PI * calendar["hour_alberta"] / 24.0)
 
-    calendar["month_cos"] = np.cos(
-        2.0
-        * np.pi
-        * (
-            calendar["month_alberta"]
-            - 1
-        )
-        / 12.0
-    )
+    calendar["day_of_week_sin"] = np.sin(TWO_PI * calendar["day_of_week_alberta"] / 7.0)
+    calendar["day_of_week_cos"] = np.cos(TWO_PI * calendar["day_of_week_alberta"] / 7.0)
+
+    calendar["month_sin"] = np.sin(TWO_PI * (calendar["month_alberta"] - 1) / 12.0)
+    calendar["month_cos"] = np.cos(TWO_PI * (calendar["month_alberta"] - 1) / 12.0)
 
     # 366 preserves a consistent denominator across leap and non-leap years.
-    calendar["day_of_year_sin"] = np.sin(
-        2.0
-        * np.pi
-        * (
-            calendar["day_of_year_alberta"]
-            - 1
-        )
-        / 366.0
-    )
-
-    calendar["day_of_year_cos"] = np.cos(
-        2.0
-        * np.pi
-        * (
-            calendar["day_of_year_alberta"]
-            - 1
-        )
-        / 366.0
-    )
+    calendar["day_of_year_sin"] = np.sin(TWO_PI * (calendar["day_of_year_alberta"] - 1) / 366.0)
+    calendar["day_of_year_cos"] = np.cos(TWO_PI * (calendar["day_of_year_alberta"] - 1) / 366.0)
 
     return (
         calendar,
@@ -883,14 +720,7 @@ def audit_calendar_features(
         tz="UTC",
     )
 
-    timestamp_index = pd.DatetimeIndex(
-        pd.to_datetime(
-            calendar[
-                "timestamp_utc"
-            ],
-            utc=True,
-        )
-    )
+    timestamp_index = pd.DatetimeIndex(pd.to_datetime(calendar["timestamp_utc"],utc=True,))
 
     add_check(
         rows,
@@ -903,51 +733,33 @@ def audit_calendar_features(
     add_check(
         rows,
         "expected_row_count",
-        len(calendar)
-        == len(
-            expected_index
-        ),
+        len(calendar) == len(expected_index),
         len(calendar),
-        len(
-            expected_index
-        ),
+        len(expected_index),
     )
 
     add_check(
         rows,
         "timestamp_start",
-        timestamp_index.min()
-        == start_utc,
-        str(
-            timestamp_index.min()
-        ),
-        str(
-            start_utc
-        ),
+        timestamp_index.min() == start_utc,
+        str(timestamp_index.min()),
+        str(start_utc),
     )
 
     add_check(
         rows,
         "timestamp_end",
-        timestamp_index.max()
-        == end_utc,
-        str(
-            timestamp_index.max()
-        ),
-        str(
-            end_utc
-        ),
+        timestamp_index.max() == end_utc,
+        str(timestamp_index.max()),
+        str(end_utc),
     )
 
     add_check(
         rows,
         "timestamps_unique",
         timestamp_index.is_unique,
-        int(
-            timestamp_index
-            .duplicated()
-            .sum()
-        ),
+        int(timestamp_index.duplicated().sum()
+        ), 
         0,
     )
 
@@ -959,37 +771,23 @@ def audit_calendar_features(
         True,
     )
 
-    missing_hours = expected_index.difference(
-        timestamp_index
-    )
+    missing_hours = expected_index.difference(timestamp_index)
 
-    extra_hours = timestamp_index.difference(
-        expected_index
-    )
+    extra_hours = timestamp_index.difference(expected_index)
 
     add_check(
         rows,
         "missing_hours",
-        len(
-            missing_hours
-        )
-        == 0,
-        len(
-            missing_hours
-        ),
+        len(missing_hours) == 0,
+        len(missing_hours),
         0,
     )
 
     add_check(
         rows,
         "extra_hours",
-        len(
-            extra_hours
-        )
-        == 0,
-        len(
-            extra_hours
-        ),
+        len(extra_hours) == 0,
+        len(extra_hours),
         0,
     )
 
@@ -997,26 +795,14 @@ def audit_calendar_features(
         timestamp_index
     ) > 1:
         bad_spacing = (
-            pd.Series(
-                timestamp_index
-            )
-            .diff()
-            .dropna()
-            .ne(
-                pd.Timedelta(
-                    hours=1
-                )
-            )
-            .sum()
+            pd.Series(timestamp_index).diff().dropna().ne(pd.Timedelta(hours=1)).sum()
         )
 
         add_check(
             rows,
             "hourly_spacing",
             bad_spacing == 0,
-            int(
-                bad_spacing
-            ),
+            int(bad_spacing),
             0,
         )
 
@@ -1024,16 +810,12 @@ def audit_calendar_features(
         rows,
         "no_missing_values",
         not calendar.isna().any().any(),
-        int(
-            calendar
-            .isna()
-            .sum()
-            .sum()
-        ),
+        int(calendar.isna().sum().sum()),
         0,
     )
 
-    for column in BINARY_COLUMNS:
+    for column in BINARY_COLUMNS: # (is_weekday, is_weekend, is_holiday, is_business_day)
+        # Confirm the column is actually in the calendar dataframe.      
         if column not in calendar.columns:
             add_check(
                 rows,
@@ -1042,19 +824,18 @@ def audit_calendar_features(
                 False,
                 True,
             )
+            # Skip the rest of the iteration if the column does not exist. 
+            # There's no point in checking the values of a column that does not exist. 
             continue
 
+        # Check for invalid values - values that are not either 0, or 1. 
+        # Sum the total number of invalid values. 
         invalid_count = int(
             (
-                ~calendar[column]
-                .isin(
-                    [
-                        0,
-                        1,
-                    ]
-                )
-            )
-            .sum()
+                # ~ means flip the boolean value (True -> False, and vice versa).
+                # This means we have a boolean list of "is this value invalid"?
+                ~calendar[column].isin([0, 1])
+            ).sum()
         )
 
         add_check(
@@ -1065,86 +846,37 @@ def audit_calendar_features(
             0,
         )
 
+    # The value of the weekday column, and the value of the weekday column
+    # should always add to 1. It can never be the weekend, when its the weekday. 
     add_check(
         rows,
         "weekday_weekend_complement",
-        (
-            calendar[
-                "is_weekday"
-            ]
-            + calendar[
-                "is_weekend"
-            ]
-        )
-        .eq(1)
+        (calendar["is_weekday"] + calendar["is_weekend"]).eq(1)
+        # Check if this is true for all rows. 
         .all(),
-        int(
-            (
-                (
-                    calendar[
-                        "is_weekday"
-                    ]
-                    + calendar[
-                        "is_weekend"
-                    ]
-                )
-                != 1
-            )
-            .sum()
-        ),
+        # Sum of rows that violate this rule. 
+        # Should be zero. 
+        int(((calendar["is_weekday"] + calendar["is_weekend"])!= 1).sum()),
         0,
     )
 
+    # Business days should be the same as weekdays when its not a holiday. 
+    # Sum when this is not the case.
     add_check(
         rows,
         "business_day_logic",
-        (
-            calendar[
-                "is_business_day"
-            ]
-            == (
-                calendar[
-                    "is_weekday"
-                ].eq(1)
-                & calendar[
-                    "is_holiday"
-                ].eq(0)
-            ).astype(
-                "int8"
-            )
-        )
+        (calendar["is_business_day"] == (calendar["is_weekday"].eq(1) & calendar["is_holiday"].eq(0)).astype("int8"))
         .all(),
-        int(
-            (
-                calendar[
-                    "is_business_day"
-                ]
-                != (
-                    calendar[
-                        "is_weekday"
-                    ].eq(1)
-                    & calendar[
-                        "is_holiday"
-                    ].eq(0)
-                ).astype(
-                    "int8"
-                )
-            )
-            .sum()
-        ),
+        int((calendar["is_business_day"] != (calendar["is_weekday"].eq(1) & calendar["is_holiday"].eq(0)).astype("int8")).sum()),
         0,
     )
 
+    # Verify that all hours are within the valid 24 hour range. 
     add_check(
         rows,
         "valid_hour_range",
-        calendar[
-            "hour_alberta"
-        ]
-        .between(
-            0,
-            23,
-        )
+        calendar["hour_alberta"]
+        .between(0,23,)
         .all(),
         (
             f"min={calendar['hour_alberta'].min()}, "
@@ -1156,13 +888,8 @@ def audit_calendar_features(
     add_check(
         rows,
         "valid_day_of_week_range",
-        calendar[
-            "day_of_week_alberta"
-        ]
-        .between(
-            0,
-            6,
-        )
+        calendar["day_of_week_alberta"]
+        .between(0, 6)
         .all(),
         (
             f"min={calendar['day_of_week_alberta'].min()}, "
@@ -1174,13 +901,8 @@ def audit_calendar_features(
     add_check(
         rows,
         "valid_month_range",
-        calendar[
-            "month_alberta"
-        ]
-        .between(
-            1,
-            12,
-        )
+        calendar["month_alberta"]
+        .between(1, 12)
         .all(),
         (
             f"min={calendar['month_alberta'].min()}, "
@@ -1189,54 +911,38 @@ def audit_calendar_features(
         "[1, 12]",
     )
 
+    # Set of unique seasons in the calendar dataframe. 
     observed_seasons = set(
-        calendar[
-            "season"
-        ]
+        calendar["season"]
         .unique()
     )
 
+    # Ensure that the observed seasons are all valid seasons. 
     add_check(
         rows,
         "valid_season_values",
-        observed_seasons.issubset(
-            VALID_SEASONS
-        ),
-        "; ".join(
-            sorted(
-                observed_seasons
-            )
-        ),
-        "; ".join(
-            sorted(
-                VALID_SEASONS
-            )
-        ),
+        observed_seasons.issubset(VALID_SEASONS),
+        # Join formating. 
+        "; ".join(sorted(observed_seasons)),
+        "; ".join(sorted(VALID_SEASONS)),
     )
 
+    # Loop through every cyclical feature, find the smallest
+    # and largest value in that column. Ensure all values are within
+    # -1 and +1 sin/cos limits. 
     for column in CYCLICAL_COLUMNS:
+        # Skip if the column does not exist. 
         if column not in calendar.columns:
             continue
 
-        column_min = float(
-            calendar[column]
-            .min()
-        )
+        column_min = float(calendar[column].min())
 
-        column_max = float(
-            calendar[column]
-            .max()
-        )
+        column_max = float(calendar[column].max())
 
         add_check(
             rows,
             f"cyclical_range__{column}",
-            (
-                column_min
-                >= -1.000001
-                and column_max
-                <= 1.000001
-            ),
+            (column_min >= -1.000001 and column_max <= 1.000001),
             (
                 f"min={column_min:.6g}, "
                 f"max={column_max:.6g}"
@@ -1244,36 +950,19 @@ def audit_calendar_features(
             "[-1, 1]",
         )
 
+    # The first check verifies that every row marked as a holiday 
+    # has a non-empty holiday name. Ensure that every selected holiday 
+    # has more than zero characters. 
     add_check(
         rows,
         "holiday_names_present_for_holiday_rows",
-        (
-            calendar.loc[
-                calendar[
-                    "is_holiday"
-                ].eq(1),
-                "holiday_name",
-            ]
-            .str.len()
-            .gt(0)
-            .all()
-        ),
-        int(
-            (
-                calendar.loc[
-                    calendar[
-                        "is_holiday"
-                    ].eq(1),
-                    "holiday_name",
-                ]
-                .str.len()
-                .eq(0)
-            )
-            .sum()
-        ),
+        (calendar.loc[calendar["is_holiday"].eq(1),"holiday_name",].str.len().gt(0).all()),
+        # Sum of times the holiday name is empty. 
+        int((calendar.loc[calendar["is_holiday"].eq(1),"holiday_name",].str.len().eq(0)).sum()),
         0,
     )
 
+    # Valid category names. 
     period_categories = {
         "overnight",
         "morning_ramp",
@@ -1282,31 +971,24 @@ def audit_calendar_features(
         "late_evening",
     }
 
+    # Collect every distinct value actually present in the dataset. 
     observed_periods = set(
-        calendar[
-            "period_of_day"
-        ]
-        .unique()
+        calendar["period_of_day"].unique()
     )
 
+    # Ensure the observed periods are within the valid category names. 
+    # Still passes if only one expected category is present, as long as it is valid. 
     add_check(
         rows,
         "valid_period_of_day_values",
-        observed_periods.issubset(
-            period_categories
-        ),
-        "; ".join(
-            sorted(
-                observed_periods
-            )
-        ),
-        "; ".join(
-            sorted(
-                period_categories
-            )
-        ),
+        observed_periods.issubset(period_categories),
+        # Formating the categories actually found. 
+        "; ".join(sorted(observed_periods)),
+        # Formating the expected categories. 
+        "; ".join(sorted(period_categories)),
     )
 
+    # Create a list of columns with numeric datatypes. 
     numeric_columns = (
         calendar
         .select_dtypes(
@@ -1319,6 +1001,9 @@ def audit_calendar_features(
         .tolist()
     )
 
+    # Create descriptive statistics for each numeric calendar column,
+    # including selected percentiles. Transpose the result so each
+    # feature is represented by one row, then standardize column names.
     summary = (
         calendar[
             numeric_columns
@@ -1344,6 +1029,8 @@ def audit_calendar_features(
         )
     )
 
+    # Sum the number of missing values found in each numeric column
+    # (one value for each numeric column).
     summary[
         "missing_count"
     ] = (
@@ -1355,6 +1042,8 @@ def audit_calendar_features(
         .values
     )
 
+    # Percentage of missing values for each numeric column
+    # (one value for each numeric column). 
     summary[
         "missing_pct"
     ] = (
@@ -1367,6 +1056,7 @@ def audit_calendar_features(
         * 100.0
     )
 
+    # Datatype for each numeric column's values. 
     summary[
         "dtype"
     ] = [
@@ -1378,10 +1068,13 @@ def audit_calendar_features(
         in numeric_columns
     ]
 
+    # Create the full audit dataframe with the list of datasets in rows. 
+    # Every add() call added a dataset to the rows list. 
     audit = pd.DataFrame(
         rows
     )
 
+    # Collect the 'pass' column value from each error-level severity audit. 
     error_checks = audit.loc[
         audit[
             "severity"
@@ -1391,6 +1084,8 @@ def audit_calendar_features(
         "pass",
     ]
 
+    # Calculate the overall pass result based only on the error-level severity. 
+    # Warnings, and information checks are avoided here. 
     audit_pass = (
         bool(
             error_checks.all()
@@ -1399,6 +1094,9 @@ def audit_calendar_features(
         else True
     )
 
+    # Return 3 objects: audit (the table containing every validation check),
+    # summary (the descriptive statistics table for the numeric columns),
+    # audit_pass (a single boolean indicating whether all error-level checks passed).
     return (
         audit,
         summary,
@@ -1539,25 +1237,14 @@ def process_calendar_features(
 
     started = time.perf_counter()
 
-    start_utc = parse_utc_timestamp(
-        start,
-        "start",
-    )
+    start_utc = parse_utc_timestamp(start,"start",)
 
-    end_utc = parse_utc_timestamp(
-        end,
-        "end",
-    )
+    end_utc = parse_utc_timestamp(end, "end")
 
-    validate_range(
-        start_utc,
-        end_utc,
-    )
+    validate_range(start_utc,end_utc,)
 
-    if (
-        OUTPUT_PARQUET.exists()
-        and not overwrite
-    ):
+    # Parquet is the canonical output of the pipeline. 
+    if (OUTPUT_PARQUET.exists() and not overwrite):
         return {
             "dataset": "calendar_features",
             "status": "skipped_existing",
