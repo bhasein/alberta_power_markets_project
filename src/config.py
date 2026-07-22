@@ -23,7 +23,7 @@ PA_TABLE_CSV = PREPROCESSING_DIR / "pa_hourly_preprocessed.csv"
 INTERTIES_HOUR_AHEAD_CSV = PREPROCESSING_DIR / "interties_hour_ahead_preprocessed.csv"
 INTERTIE_CAPABILITY_CSV = PREPROCESSING_DIR / "intertie_capability_preprocessed.csv"
 GENERATION_CSV = PREPROCESSING_DIR / "generation_by_fuel_preprocessed.csv"
-OUTAGES_CSV = PREPROCESSING_DIR / "outages_preprocessed_preprocessed.csv"
+OUTAGES_CSV = PREPROCESSING_DIR / "outages_preprocessed.csv"
 WIND_PROJECTS_CSV = PREPROCESSING_DIR / "wind_projects_preprocessed.csv"
 SOLAR_PROJECTS_CSV = PREPROCESSING_DIR / "solar_projects_preprocessed.csv"
 
@@ -41,7 +41,33 @@ ERA5_PREPROCESSING_DIR = WEATHER_PREPROCESSING_DIR / "era5"
 
 ERA5_MONTHLY_STANDARDIZED_DIR = (ERA5_PREPROCESSING_DIR / "monthly_standardized")
 
-# Notebooks
+# Feature Engineering
+# Feature Engineering
+# Feature Engineering
+CALENDAR_FEATURES = (
+    FEATURES_DIR
+    / "calendar"
+    / "calendar_features_hourly.parquet"
+)
+
+LOAD_WEATHER_FEATURES = (
+    FEATURES_DIR
+    / "weather"
+    / "load_weather_features_hourly.parquet"
+)
+
+MARKET_FEATURES = (
+    FEATURES_DIR
+    / "market"
+    / "market_features_hourly.parquet"
+)
+
+RENEWABLE_WEATHER_FEATURES = (
+    FEATURES_DIR
+    / "weather"
+    / "renewable_weather_features_hourly.parquet"
+)
+
 NOTEBOOKS_DIR = PROJECT_ROOT / "notebooks"
 
 # Random Seed

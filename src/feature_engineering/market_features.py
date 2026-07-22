@@ -19,12 +19,43 @@ The script searches for these preprocessed datasets:
 3. Outage data
    - outages_preprocessed.parquet
 
-Output
-------
-data/features/market/market_features_hourly.parquet
-data/audits/market_features_audit_checks.csv
-data/audits/market_features_feature_summary.csv
-data/audits/market_features_source_summary.csv
+Outputs
+-------
+Canonical feature output:
+
+    data/features/market/market_features_hourly.parquet
+
+Optional full CSV output:
+
+    data/features/market/market_features_hourly.csv
+
+Audit outputs:
+
+    data/audits/market_features_audit_checks.csv
+    data/audits/market_features_feature_summary.csv
+    data/audits/market_features_source_summary.csv
+
+Run
+---
+Standard run:
+
+    python src/feature_engineering/market_features.py
+
+Overwrite existing outputs:
+
+    python src/feature_engineering/market_features.py \
+        --overwrite
+
+Write CSV as well:
+
+    python src/feature_engineering/market_features.py \
+        --overwrite \
+        --write-csv
+
+Verbose logging:
+
+    python src/feature_engineering/market_features.py \
+        --verbose
 
 Design
 ------
@@ -39,39 +70,82 @@ FEATURE_BUILDERS without changing the input/output pipeline.
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
 
 
 # ============================================================================
+# Logging
+# ============================================================================
+
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging(
+    verbose: bool = False,
+) -> None:
+    """Configure console logging for the pipeline."""
+
+    logging.basicConfig(
+        level=(
+            logging.DEBUG
+            if verbose
+            else logging.INFO
+        ),
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+# ============================================================================
 # Paths
 # ============================================================================
 
-PROJECT_ROOT = Path(
-    "/Users/brodiehasein/alberta_power_markets_project"
-)
+# This file is expected to live at:
+#
+#     PROJECT_ROOT/src/feature_engineering/market_features.py
+#
+# parents[0] -> feature_engineering
+# parents[1] -> src
+# parents[2] -> project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-PREPROCESSING_DIR = PROJECT_ROOT / "data/preprocessing"
-OUTPUT_DIR = PROJECT_ROOT / "data/features/market"
-AUDIT_DIR = PROJECT_ROOT / "data/audits"
+PREPROCESSING_DIR = PROJECT_ROOT / "data" / "preprocessing"
+FEATURES_DIR = PROJECT_ROOT / "data" / "features"
+OUTPUT_DIR = FEATURES_DIR / "market"
+AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
 
-OUTPUT_FILE = OUTPUT_DIR / "market_features_hourly.parquet"
+OUTPUT_PARQUET = OUTPUT_DIR / "market_features_hourly.parquet"
+OUTPUT_CSV = OUTPUT_DIR / "market_features_hourly.csv"
+CALENDAR_FILE = (FEATURES_DIR / "calendar" / "calendar_features_hourly.parquet")
+
+# Backward-compatible alias retained for code that imports OUTPUT_FILE.
+OUTPUT_FILE = OUTPUT_PARQUET
 
 AUDIT_FILE = AUDIT_DIR / "market_features_audit_checks.csv"
 FEATURE_SUMMARY_FILE = AUDIT_DIR / "market_features_feature_summary.csv"
 SOURCE_SUMMARY_FILE = AUDIT_DIR / "market_features_source_summary.csv"
 
 PA_FILE_CANDIDATES = [
+    PREPROCESSING_DIR / "pa_hourly_preprocessed.parquet",
     PREPROCESSING_DIR / "pa_preprocessed.parquet",
     PREPROCESSING_DIR / "price_ail_gas_preprocessed.parquet",
     PREPROCESSING_DIR / "p_and_a_preprocessed.parquet",
 ]
 
 INTERTIE_FILE_CANDIDATES = [
+    PREPROCESSING_DIR / "interties_hour_ahead.parquet",
+    PREPROCESSING_DIR / "interties_hour_ahead_preprocessed.parquet",
     PREPROCESSING_DIR / "intertie_preprocessed.parquet",
     PREPROCESSING_DIR / "interties_preprocessed.parquet",
 ]
@@ -86,6 +160,16 @@ OUTAGE_FILE_CANDIDATES = [
 # ============================================================================
 
 LOCAL_TIMEZONE = "America/Edmonton"
+DATASET_NAME = "market_features"
+
+REQUIRED_BACKBONE_COLUMNS = [
+    "timestamp_utc",
+    "ail_mw",
+    "pool_price",
+    "gas_price",
+    "spark_spread",
+    "pa_available",
+]
 
 PRICE_THRESHOLDS = {
     "price_above_100": 100.0,
@@ -105,6 +189,20 @@ ROLLING_WINDOWS = [3, 6, 12, 24, 72, 168]
 # ============================================================================
 # General helpers
 # ============================================================================
+
+def ensure_output_directories() -> None:
+    """Create feature and audit output directories if needed."""
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    AUDIT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
 
 def add_check(
     rows: list[dict],
@@ -154,6 +252,11 @@ def resolve_file(
 ) -> Path:
     for path in candidates:
         if path.exists():
+            LOGGER.info(
+                "Resolved %s input: %s",
+                dataset_name,
+                path,
+            )
             return path
 
     candidate_text = "\n".join(
@@ -202,6 +305,12 @@ def load_parquet_table(
     path: Path,
     dataset_name: str,
 ) -> pd.DataFrame:
+    LOGGER.info(
+        "Loading %s data from %s.",
+        dataset_name,
+        path,
+    )
+
     frame = normalize_columns(
         pd.read_parquet(path)
     )
@@ -377,11 +486,13 @@ def load_pa_data(
         ],
         "pool_price": [
             "pool_price",
+            "pool_price_cad_mwh",
             "price",
             "actual_pool_price",
         ],
         "gas_price": [
             "gas_price",
+            "gas_price_cad_gj",
             "aeco_price",
             "aeco_price_cad_gj",
         ],
@@ -443,6 +554,56 @@ def load_intertie_data(
         )
     )
 
+    import_columns = [
+        "import_bc",
+        "import_mt",
+        "import_sk",
+    ]
+
+    export_columns = [
+        "export_bc",
+        "export_mt",
+        "export_sk",
+    ]
+
+    directional_columns = (
+        import_columns
+        + export_columns
+    )
+
+    missing_directional_columns = sorted(
+        set(directional_columns)
+        - set(frame.columns)
+    )
+
+    if missing_directional_columns:
+        raise ValueError(
+            "Intertie data is missing required directional columns: "
+            f"{missing_directional_columns}"
+        )
+
+    negative_counts = {
+        column: int(
+            frame[column]
+            .lt(0)
+            .sum()
+        )
+        for column in directional_columns
+        if frame[column].lt(0).any()
+    }
+
+    if negative_counts:
+        raise ValueError(
+            "Preprocessed intertie data still contains negative "
+            "directional flows. Signed-flow correction must occur "
+            "in the intertie preprocessing pipeline. "
+            f"Negative counts: {negative_counts}"
+        )
+
+    LOGGER.info(
+        "Validated non-negative directional intertie flows."
+    )
+
     frame["intertie_available"] = 1
 
     return frame
@@ -469,6 +630,80 @@ def load_outage_data(
 
     return frame
 
+def load_calendar_data(
+    path: Path,
+) -> pd.DataFrame:
+    """
+    Load the canonical hourly calendar-feature dataset.
+
+    Calendar features must be built first by calendar_features.py.
+    """
+
+    if not path.exists():
+        raise FileNotFoundError(
+            "Canonical calendar features were not found at:\n"
+            f"  {path}\n"
+            "Run calendar_features.py first."
+        )
+
+    LOGGER.info(
+        "Loading canonical calendar features from %s.",
+        path,
+    )
+
+    calendar = pd.read_parquet(
+        path
+    )
+
+    calendar = normalize_columns(
+        calendar
+    )
+
+    require_columns(
+        calendar,
+        [
+            "timestamp_utc",
+            "hour_alberta",
+            "day_of_week_alberta",
+            "month_alberta",
+            "year_alberta",
+            "is_weekend",
+            "is_business_hour",
+            "is_morning_ramp",
+            "is_evening_peak",
+        ],
+        "calendar features",
+    )
+
+    calendar["timestamp_utc"] = pd.to_datetime(
+        calendar["timestamp_utc"],
+        utc=True,
+        errors="coerce",
+    )
+
+    invalid_timestamps = int(
+        calendar["timestamp_utc"]
+        .isna()
+        .sum()
+    )
+
+    if invalid_timestamps:
+        raise ValueError(
+            "Calendar features contain "
+            f"{invalid_timestamps} invalid timestamps."
+        )
+
+    calendar = (
+        calendar
+        .drop_duplicates(
+            subset=["timestamp_utc"],
+            keep="last",
+        )
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
+
+    return calendar
 
 # ============================================================================
 # Intertie features
@@ -484,6 +719,9 @@ def identify_directional_columns(
         lower = column.lower()
 
         if column == "timestamp_utc":
+            continue
+
+        if lower.endswith("_raw"):
             continue
 
         if "total" in lower or "net_" in lower:
@@ -896,49 +1134,6 @@ def add_market_pressure_features(
     return output
 
 
-def add_calendar_features(
-    frame: pd.DataFrame,
-) -> pd.DataFrame:
-    output = frame.copy()
-
-    local = output[
-        "timestamp_utc"
-    ].dt.tz_convert(
-        LOCAL_TIMEZONE
-    )
-
-    output["hour_alberta"] = local.dt.hour.astype("int8")
-    output["day_of_week_alberta"] = local.dt.dayofweek.astype("int8")
-    output["month_alberta"] = local.dt.month.astype("int8")
-    output["year_alberta"] = local.dt.year.astype("int16")
-
-    output["is_weekend"] = (
-        output["day_of_week_alberta"]
-        >= 5
-    ).astype("int8")
-
-    output["is_business_hour"] = (
-        output["hour_alberta"]
-        .between(8, 17)
-        & (
-            output["is_weekend"]
-            == 0
-        )
-    ).astype("int8")
-
-    output["is_morning_ramp"] = (
-        output["hour_alberta"]
-        .between(5, 9)
-    ).astype("int8")
-
-    output["is_evening_peak"] = (
-        output["hour_alberta"]
-        .between(16, 21)
-    ).astype("int8")
-
-    return output
-
-
 FEATURE_BUILDERS: list[
     Callable[
         [pd.DataFrame],
@@ -951,7 +1146,6 @@ FEATURE_BUILDERS: list[
     add_load_features,
     add_gas_and_spread_features,
     add_market_pressure_features,
-    add_calendar_features,
 ]
 
 
@@ -976,6 +1170,7 @@ def merge_sources(
     pa: pd.DataFrame,
     intertie: pd.DataFrame,
     outages: pd.DataFrame,
+    calendar: pd.DataFrame,
 ) -> pd.DataFrame:
     output = pa.copy()
 
@@ -988,6 +1183,13 @@ def merge_sources(
 
     output = output.merge(
         outages,
+        on="timestamp_utc",
+        how="left",
+        validate="one_to_one",
+    )
+
+    output = output.merge(
+        calendar,
         on="timestamp_utc",
         how="left",
         validate="one_to_one",
@@ -1133,7 +1335,7 @@ def audit_market_features(
         "outage_available",
     ]:
         invalid = int(
-            ~frame[flag].isin([0, 1])
+            (~frame[flag].isin([0, 1])).sum()
         )
 
         add_check(
@@ -1155,10 +1357,9 @@ def audit_market_features(
 
     if "total_outage_mw" in frame.columns:
         negative = int(
-            (
-                frame["total_outage_mw"]
-                < 0
-            ).sum()
+            frame["total_outage_mw"]
+            .lt(0)
+            .sum()
         )
 
         add_check(
@@ -1170,12 +1371,49 @@ def audit_market_features(
             severity="warning",
         )
 
+    # Check every cleaned directional intertie column directly.
+    #
+    # These are error-level checks because negative values should have
+    # already been reclassified to the opposite direction.
+    directional_intertie_columns = [
+        "import_bc",
+        "import_mt",
+        "import_sk",
+        "export_bc",
+        "export_mt",
+        "export_sk",
+    ]
+
+    for column in directional_intertie_columns:
+        if column not in frame.columns:
+            add_check(
+                rows,
+                f"{column}_present",
+                False,
+                "missing",
+                "present",
+            )
+            continue
+
+        negative_count = int(
+            frame[column]
+            .lt(0)
+            .sum()
+        )
+
+        add_check(
+            rows,
+            f"{column}_non_negative",
+            negative_count == 0,
+            negative_count,
+            0,
+        )
+
     if "total_imports_mw" in frame.columns:
         negative = int(
-            (
-                frame["total_imports_mw"]
-                < 0
-            ).sum()
+            frame["total_imports_mw"]
+            .lt(0)
+            .sum()
         )
 
         add_check(
@@ -1184,15 +1422,13 @@ def audit_market_features(
             negative == 0,
             negative,
             0,
-            severity="warning",
         )
 
     if "total_exports_mw" in frame.columns:
         negative = int(
-            (
-                frame["total_exports_mw"]
-                < 0
-            ).sum()
+            frame["total_exports_mw"]
+            .lt(0)
+            .sum()
         )
 
         add_check(
@@ -1201,7 +1437,6 @@ def audit_market_features(
             negative == 0,
             negative,
             0,
-            severity="warning",
         )
 
     numeric_columns = [
@@ -1309,21 +1544,249 @@ def print_report(
 
 
 # ============================================================================
+# Output helpers
+# ============================================================================
+
+def save_audit_outputs(
+    audit: pd.DataFrame,
+    feature_summary: pd.DataFrame,
+    source_summary_frame: pd.DataFrame,
+) -> None:
+    """Write all market-feature audit and source-summary outputs."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing market-feature audit checks to %s.",
+        AUDIT_FILE,
+    )
+
+    audit.to_csv(
+        AUDIT_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing market-feature numeric summary to %s.",
+        FEATURE_SUMMARY_FILE,
+    )
+
+    feature_summary.to_csv(
+        FEATURE_SUMMARY_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing market-feature source summary to %s.",
+        SOURCE_SUMMARY_FILE,
+    )
+
+    source_summary_frame.to_csv(
+        SOURCE_SUMMARY_FILE,
+        index=False,
+    )
+
+
+def save_feature_outputs(
+    frame: pd.DataFrame,
+    write_csv: bool,
+) -> None:
+    """Write canonical Parquet and optional CSV feature outputs."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing canonical market-feature Parquet to %s.",
+        OUTPUT_PARQUET,
+    )
+
+    frame.to_parquet(
+        OUTPUT_PARQUET,
+        index=False,
+    )
+
+    if write_csv:
+        LOGGER.info(
+            "Writing optional market-feature CSV to %s.",
+            OUTPUT_CSV,
+        )
+
+        frame.to_csv(
+            OUTPUT_CSV,
+            index=False,
+        )
+
+
+def existing_outputs_satisfy_request(
+    write_csv: bool,
+) -> bool:
+    """
+    Return True when every requested feature output already exists.
+
+    Parquet is always required. CSV is required only when write_csv=True.
+    """
+
+    parquet_exists = OUTPUT_PARQUET.exists()
+
+    csv_requirement_satisfied = (
+        OUTPUT_CSV.exists()
+        if write_csv
+        else True
+    )
+
+    return (
+        parquet_exists
+        and csv_requirement_satisfied
+    )
+
+
+def read_existing_parquet_for_csv() -> pd.DataFrame:
+    """
+    Load the canonical Parquet when only a missing CSV output is requested.
+    """
+
+    LOGGER.info(
+        "Loading existing market-feature Parquet from %s.",
+        OUTPUT_PARQUET,
+    )
+
+    frame = pd.read_parquet(
+        OUTPUT_PARQUET
+    )
+
+    if "timestamp_utc" in frame.columns:
+        frame["timestamp_utc"] = pd.to_datetime(
+            frame["timestamp_utc"],
+            utc=True,
+        )
+
+    return frame
+
+
+# ============================================================================
 # Pipeline
 # ============================================================================
 
 def build_market_features(
     overwrite: bool = False,
-) -> dict:
+    write_csv: bool = False,
+) -> dict[str, Any]:
+    """Load, merge, engineer, audit, and save market features."""
+
     started = time.perf_counter()
 
-    if OUTPUT_FILE.exists() and not overwrite:
+    LOGGER.info("Starting market-feature pipeline.")
+    LOGGER.debug("Project root: %s", PROJECT_ROOT)
+    LOGGER.debug("Preprocessing directory: %s", PREPROCESSING_DIR)
+    LOGGER.debug("Feature output directory: %s", OUTPUT_DIR)
+    LOGGER.debug("Audit output directory: %s", AUDIT_DIR)
+
+    ensure_output_directories()
+
+    # Skip only when all explicitly requested feature outputs already exist.
+    if (
+        not overwrite
+        and existing_outputs_satisfy_request(
+            write_csv=write_csv
+        )
+    ):
+        LOGGER.info(
+            "Requested market-feature outputs already exist. "
+            "Use --overwrite to rebuild them."
+        )
+
         return {
-            "dataset": "market_features",
+            "dataset": DATASET_NAME,
             "status": "skipped_existing",
             "pass": True,
-            "output_file": str(OUTPUT_FILE),
+            "rows": None,
+            "columns": None,
+            "parquet_file": str(OUTPUT_PARQUET),
+            "csv_file": (
+                str(OUTPUT_CSV)
+                if write_csv
+                else "not requested"
+            ),
+            "audit_file": (
+                str(AUDIT_FILE)
+                if AUDIT_FILE.exists()
+                else "not available"
+            ),
+            "feature_summary_file": (
+                str(FEATURE_SUMMARY_FILE)
+                if FEATURE_SUMMARY_FILE.exists()
+                else "not available"
+            ),
+            "source_summary_file": (
+                str(SOURCE_SUMMARY_FILE)
+                if SOURCE_SUMMARY_FILE.exists()
+                else "not available"
+            ),
+            "processing_seconds": round(
+                time.perf_counter()
+                - started,
+                3,
+            ),
         }
+
+    # If the canonical Parquet already exists and CSV is the only missing
+    # requested representation, create it directly without rebuilding.
+    if (
+        not overwrite
+        and OUTPUT_PARQUET.exists()
+        and write_csv
+        and not OUTPUT_CSV.exists()
+    ):
+        frame = read_existing_parquet_for_csv()
+
+        LOGGER.info(
+            "Creating missing CSV from existing canonical Parquet."
+        )
+
+        frame.to_csv(
+            OUTPUT_CSV,
+            index=False,
+        )
+
+        return {
+            "dataset": DATASET_NAME,
+            "status": "csv_created_from_existing_parquet",
+            "pass": True,
+            "rows": len(frame),
+            "columns": len(frame.columns),
+            "start_utc": str(
+                frame["timestamp_utc"].min()
+            ),
+            "end_utc": str(
+                frame["timestamp_utc"].max()
+            ),
+            "parquet_file": str(OUTPUT_PARQUET),
+            "csv_file": str(OUTPUT_CSV),
+            "audit_file": (
+                str(AUDIT_FILE)
+                if AUDIT_FILE.exists()
+                else "not available"
+            ),
+            "feature_summary_file": (
+                str(FEATURE_SUMMARY_FILE)
+                if FEATURE_SUMMARY_FILE.exists()
+                else "not available"
+            ),
+            "source_summary_file": (
+                str(SOURCE_SUMMARY_FILE)
+                if SOURCE_SUMMARY_FILE.exists()
+                else "not available"
+            ),
+            "processing_seconds": round(
+                time.perf_counter()
+                - started,
+                3,
+            ),
+        }
+
+    # ------------------------------------------------------------------------
+    # Source resolution and loading
+    # ------------------------------------------------------------------------
 
     pa_path = resolve_file(
         PA_FILE_CANDIDATES,
@@ -1352,6 +1815,10 @@ def build_market_features(
         outage_path
     )
 
+    calendar = load_calendar_data(
+        CALENDAR_FILE
+    )
+
     source_summary_frame = pd.DataFrame(
         [
             source_summary(
@@ -1372,15 +1839,46 @@ def build_market_features(
         ]
     )
 
+    LOGGER.info(
+        "Loaded sources: P&A=%s rows, intertie=%s rows, outages=%s rows.",
+        f"{len(pa):,}",
+        f"{len(intertie):,}",
+        f"{len(outages):,}",
+    )
+
+    # ------------------------------------------------------------------------
+    # Merge and feature construction
+    # ------------------------------------------------------------------------
+
+    LOGGER.info(
+        "Merging intertie and outage data onto the P&A hourly backbone."
+    )
+
     master = merge_sources(
         pa,
         intertie,
         outages,
+        calendar,
+    )
+
+    LOGGER.info(
+        "Applying %s market feature builders.",
+        len(FEATURE_BUILDERS),
     )
 
     master = apply_feature_builders(
         master
     )
+
+    LOGGER.info(
+        "Market feature table constructed with %s rows and %s columns.",
+        f"{len(master):,}",
+        f"{len(master.columns):,}",
+    )
+
+    # ------------------------------------------------------------------------
+    # Audit
+    # ------------------------------------------------------------------------
 
     audit, feature_summary, passed = audit_market_features(
         master
@@ -1392,36 +1890,36 @@ def build_market_features(
         passed,
     )
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    AUDIT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    audit.to_csv(
-        AUDIT_FILE,
-        index=False,
-    )
-
-    feature_summary.to_csv(
-        FEATURE_SUMMARY_FILE,
-        index=False,
-    )
-
-    source_summary_frame.to_csv(
-        SOURCE_SUMMARY_FILE,
-        index=False,
+    # Audit files are retained even when the feature audit fails.
+    save_audit_outputs(
+        audit,
+        feature_summary,
+        source_summary_frame,
     )
 
     if not passed:
+        LOGGER.error(
+            "Market-feature audit failed. "
+            "Canonical feature outputs were not written."
+        )
+
         return {
-            "dataset": "market_features",
+            "dataset": DATASET_NAME,
             "status": "audit_failed",
             "pass": False,
+            "rows": len(master),
+            "columns": len(master.columns),
+            "start_utc": str(
+                master["timestamp_utc"].min()
+            ),
+            "end_utc": str(
+                master["timestamp_utc"].max()
+            ),
+            "pa_file": str(pa_path),
+            "intertie_file": str(intertie_path),
+            "outage_file": str(outage_path),
+            "parquet_file": "not written",
+            "csv_file": "not written",
             "audit_file": str(AUDIT_FILE),
             "feature_summary_file": str(FEATURE_SUMMARY_FILE),
             "source_summary_file": str(SOURCE_SUMMARY_FILE),
@@ -1432,39 +1930,70 @@ def build_market_features(
             ),
         }
 
-    master.to_parquet(
-        OUTPUT_FILE,
-        index=False,
+    # ------------------------------------------------------------------------
+    # Canonical feature outputs
+    # ------------------------------------------------------------------------
+
+    save_feature_outputs(
+        master,
+        write_csv=write_csv,
+    )
+
+    processing_seconds = round(
+        time.perf_counter()
+        - started,
+        3,
+    )
+
+    LOGGER.info(
+        "Market-feature pipeline completed successfully in %.3f seconds.",
+        processing_seconds,
     )
 
     return {
-        "dataset": "market_features",
+        "dataset": DATASET_NAME,
         "status": "saved",
         "pass": True,
         "rows": len(master),
         "columns": len(master.columns),
-        "start": str(
+        "start_utc": str(
             master["timestamp_utc"].min()
         ),
-        "end": str(
+        "end_utc": str(
             master["timestamp_utc"].max()
+        ),
+        "pa_hours": int(
+            master["pa_available"].sum()
+        ),
+        "intertie_hours": int(
+            master["intertie_available"].sum()
+        ),
+        "outage_hours": int(
+            master["outage_available"].sum()
         ),
         "pa_file": str(pa_path),
         "intertie_file": str(intertie_path),
         "outage_file": str(outage_path),
-        "output_file": str(OUTPUT_FILE),
+        "parquet_file": str(OUTPUT_PARQUET),
+        "csv_file": (
+            str(OUTPUT_CSV)
+            if write_csv
+            else "not requested"
+        ),
         "audit_file": str(AUDIT_FILE),
         "feature_summary_file": str(FEATURE_SUMMARY_FILE),
         "source_summary_file": str(SOURCE_SUMMARY_FILE),
-        "processing_seconds": round(
-            time.perf_counter()
-            - started,
-            3,
-        ),
+        "processing_seconds": processing_seconds,
     }
 
 
-def main() -> None:
+# ============================================================================
+# CLI
+# ============================================================================
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Create the command-line argument parser."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Build canonical hourly Alberta market features "
@@ -1475,24 +2004,90 @@ def main() -> None:
     parser.add_argument(
         "--overwrite",
         action="store_true",
+        help=(
+            "Rebuild and overwrite existing market-feature outputs."
+        ),
     )
 
-    args = parser.parse_args()
-
-    result = build_market_features(
-        overwrite=args.overwrite
+    parser.add_argument(
+        "--write-csv",
+        action="store_true",
+        help=(
+            "Also write the full market feature table to CSV."
+        ),
     )
 
-    print("\n" + "=" * 80)
-    print("MARKET FEATURE RESULT")
-    print("=" * 80)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable verbose DEBUG-level logging."
+        ),
+    )
+
+    return parser
+
+
+def print_pipeline_result(
+    result: dict[str, Any],
+) -> None:
+    """Print the final pipeline result dictionary."""
+
+    print(
+        "\n"
+        + "=" * 80
+    )
+
+    print(
+        "MARKET FEATURE RESULT"
+    )
+
+    print(
+        "=" * 80
+    )
 
     for key, value in result.items():
         print(
             f"{key}: {value}"
         )
 
-    print("=" * 80)
+    print(
+        "=" * 80
+    )
+
+
+def main() -> None:
+    """Run the market-feature pipeline from the command line."""
+
+    parser = build_argument_parser()
+
+    args = parser.parse_args()
+
+    configure_logging(
+        verbose=args.verbose
+    )
+
+    try:
+        result = build_market_features(
+            overwrite=args.overwrite,
+            write_csv=args.write_csv,
+        )
+
+    except Exception:
+        LOGGER.exception(
+            "Market-feature pipeline terminated with an unexpected error."
+        )
+        raise
+
+    print_pipeline_result(
+        result
+    )
+
+    if not result.get(
+        "pass",
+        False,
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -51,15 +51,33 @@ OUTPUT_PARQUET = PREPROCESSING_DIR / "interties_hour_ahead.parquet"
 AUDIT_FILE = AUDIT_DIR / "interties_audit_checks.csv"
 SUMMARY_FILE = AUDIT_DIR / "interties_feature_summary.csv"
 
-EXPECTED_COLUMNS = {
-    "timestamp_utc",
-    "hour_ahead_price_forecast",
-    "export_bc",
-    "export_mt",
-    "export_sk",
+IMPORT_COLUMNS = [
     "import_bc",
     "import_mt",
     "import_sk",
+]
+
+EXPORT_COLUMNS = [
+    "export_bc",
+    "export_mt",
+    "export_sk",
+]
+
+DIRECTIONAL_COLUMNS = (
+    IMPORT_COLUMNS
+    + EXPORT_COLUMNS
+)
+
+RAW_DIRECTIONAL_COLUMNS = [
+    f"{column}_raw"
+    for column in DIRECTIONAL_COLUMNS
+]
+
+EXPECTED_COLUMNS = {
+    "timestamp_utc",
+    "hour_ahead_price_forecast",
+    *DIRECTIONAL_COLUMNS,
+    *RAW_DIRECTIONAL_COLUMNS,
 }
 
 RAW_COLUMN_MAP = {
@@ -163,56 +181,143 @@ def clean_one_intertie_file(
     return out
 
 
+def clean_signed_intertie_flows(
+    frame: pd.DataFrame,
+    preserve_raw: bool = True,
+) -> pd.DataFrame:
+    """
+    Reclassify negative directional intertie flows to the opposite
+    direction while preserving the original reported values.
+
+    Example:
+        import_mt = -14
+        export_mt = 0
+
+    becomes:
+        import_mt = 0
+        export_mt = 14
+    """
+    output = frame.copy()
+
+    missing_columns = sorted(
+        set(DIRECTIONAL_COLUMNS)
+        - set(output.columns)
+    )
+
+    if missing_columns:
+        raise ValueError(
+            "Intertie data is missing required directional columns: "
+            f"{missing_columns}"
+        )
+
+    if preserve_raw:
+        for column in DIRECTIONAL_COLUMNS:
+            raw_column = f"{column}_raw"
+
+            if raw_column not in output.columns:
+                output[raw_column] = output[column]
+
+    for import_column, export_column in zip(
+        IMPORT_COLUMNS,
+        EXPORT_COLUMNS,
+    ):
+        negative_import = (
+            output[import_column]
+            .clip(upper=0)
+            .abs()
+        )
+
+        negative_export = (
+            output[export_column]
+            .clip(upper=0)
+            .abs()
+        )
+
+        output[import_column] = (
+            output[import_column].clip(lower=0)
+            + negative_export
+        )
+
+        output[export_column] = (
+            output[export_column].clip(lower=0)
+            + negative_import
+        )
+
+    return output
+
+
 def clean_interties(
     raw_files: list[Path] = RAW_INTERTIE_FILES,
 ) -> pd.DataFrame:
     """
-    General purpose:
-        Load, clean, combine, and deduplicate all configured intertie and
-        hour-ahead forecast source files into one chronological UTC dataset.
+    Load, standardize, combine, deduplicate, and clean all configured
+    intertie and hour-ahead forecast source files.
 
-    Role in the pipeline:
-        This is the multi-file combination stage. It produces the unified
-        hourly table consumed by audit_interties(), keeping the last record
-        when source files overlap on the same timestamp.
+    Signed directional flows are corrected here so this preprocessing
+    dataset becomes the canonical owner of cleaned intertie values.
     """
-    # Empty list to store the cleaned dataframes. 
     frames = []
 
-    # Loop through the raw files, load and clean each, 
-    # before appending the result to the empty frames list. 
     for raw_file in raw_files:
-        raw = load_raw_intertie_file(raw_file)
-        clean = clean_one_intertie_file(raw, raw_file)
+        raw = load_raw_intertie_file(
+            raw_file
+        )
+
+        clean = clean_one_intertie_file(
+            raw,
+            raw_file,
+        )
+
         frames.append(clean)
 
-    out = pd.concat(frames, ignore_index=True)
+    out = pd.concat(
+        frames,
+        ignore_index=True,
+    )
 
-    # Drop missing timestamps. 
-    # Sort by timestamp. 
-    out = out.dropna(subset=["timestamp_utc"])
-    out = out.sort_values("timestamp_utc").reset_index(drop=True)
+    out = out.dropna(
+        subset=["timestamp_utc"]
+    )
 
-    # Calculate the number of duplicate timestamps. 
-    duplicate_count = int(out["timestamp_utc"].duplicated().sum())
+    out = (
+        out
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
 
-    # If there are duplicates, handle the issue by keeping the last
-    # of the duplicate, and dropping the leading duplicates. 
-    # Reset the index, dropping the old index values. 
+    duplicate_count = int(
+        out["timestamp_utc"]
+        .duplicated()
+        .sum()
+    )
+
     if duplicate_count > 0:
         out = (
             out
-            .drop_duplicates(subset=["timestamp_utc"], keep="last")
+            .drop_duplicates(
+                subset=["timestamp_utc"],
+                keep="last",
+            )
             .sort_values("timestamp_utc")
             .reset_index(drop=True)
         )
 
-    # Drop the source file column. 
-    out = out.drop(columns=["source_file"])
+    out = out.drop(
+        columns=["source_file"]
+    )
 
-    # loc[rows, columns]. The first : means "keep all rows",
-    # the next column means keep the first instances of each column name. 
-    return out.loc[:, ~out.columns.duplicated()]
+    out = out.loc[
+        :,
+        ~out.columns.duplicated(),
+    ]
+
+    # Clean signed directional values before audit and persistence.
+    out = clean_signed_intertie_flows(
+        out,
+        preserve_raw=True,
+    )
+
+    return out
 
 
 def audit_interties(
@@ -325,17 +430,48 @@ def audit_interties(
     non_numeric = [c for c in feature_cols if not pd.api.types.is_numeric_dtype(df[c])]
     add("all_features_numeric", len(non_numeric) == 0, "; ".join(non_numeric), "all numeric")
 
-    all_null = [c for c in feature_cols if df[c].isna().all()]
-    any_null = [c for c in feature_cols if df[c].isna().any()]
+    all_null = [
+        column
+        for column in feature_cols
+        if df[column].isna().all()
+    ]
 
-    add("no_all_null_feature_columns", len(all_null) == 0, "; ".join(all_null), "")
+    columns_with_nulls = [
+        column
+        for column in feature_cols
+        if df[column].isna().any()
+    ]
+
+    expected_partial_null_columns = {
+        "import_mt",
+        "export_mt",
+        "import_mt_raw",
+        "export_mt_raw",
+        "hour_ahead_price_forecast",
+    }
+
+    unexpected_partial_null_columns = sorted(
+        set(columns_with_nulls)
+        - expected_partial_null_columns
+    )
+
     add(
-        "no_partial_null_feature_columns",
-        len(any_null) == 0,
-        "; ".join(any_null),
+        "no_all_null_feature_columns",
+        len(all_null) == 0,
+        "; ".join(all_null),
         "",
+    )
+
+    add(
+        "no_unexpected_partial_null_feature_columns",
+        len(unexpected_partial_null_columns) == 0,
+        "; ".join(unexpected_partial_null_columns),
+        "no unexpected partially missing columns",
         severity="warning",
-        notes="Some missing values may be expected, especially MT intertie before its start date or rare missing forecasts.",
+        notes=(
+            "Known Montana coverage gaps and rare missing hour-ahead "
+            "forecasts are audited separately."
+        ),
     )
 
     
@@ -353,59 +489,81 @@ def audit_interties(
             )
 
     
-    flow_cols = [
-        "export_bc",
-        "export_mt",
-        "export_sk",
-        "import_bc",
-        "import_mt",
-        "import_sk",
-    ]
+    for column in DIRECTIONAL_COLUMNS:
+        if column not in df.columns:
+            continue
 
-    for col in flow_cols:
-        if col in df.columns:
-            negative_count = int((df[col] < 0).sum())
-            add(
-                f"domain_non_negative__{col}",
-                negative_count == 0,
-                observed=negative_count,
-                expected=0,
-                severity="warning",
-            )
+        negative_count = int(
+            df[column]
+            .lt(0)
+            .sum()
+        )
 
-            add(
-                f"domain_max_recorded__{col}",
-                True,
-                observed=f"max={df[col].max(skipna=True):.6g}",
-                expected="recorded",
-                severity="info",
-            )
-
-            missing_count = int(df[col].isna().sum())
-            add(
-                f"domain_missing_count__{col}",
-                True,
-                observed=missing_count,
-                expected="recorded",
-                severity="info",
-            )
-
-    if {"import_bc", "import_mt", "import_sk"}.issubset(df.columns):
-        total_imports = df[["import_bc", "import_mt", "import_sk"]].sum(axis=1, min_count=1)
         add(
-            "domain_total_import_peak_recorded",
+            f"domain_non_negative__{column}",
+            negative_count == 0,
+            observed=negative_count,
+            expected=0,
+            severity="error",
+        )
+
+        add(
+            f"domain_max_recorded__{column}",
             True,
-            observed=f"max={total_imports.max(skipna=True):.6g}",
+            observed=(
+                f"max={df[column].max(skipna=True):.6g}"
+            ),
             expected="recorded",
             severity="info",
         )
 
-    if {"export_bc", "export_mt", "export_sk"}.issubset(df.columns):
-        total_exports = df[["export_bc", "export_mt", "export_sk"]].sum(axis=1, min_count=1)
+        missing_count = int(
+            df[column]
+            .isna()
+            .sum()
+        )
+
+        add(
+            f"domain_missing_count__{column}",
+            True,
+            observed=missing_count,
+            expected="recorded",
+            severity="info",
+        )
+
+
+    if set(IMPORT_COLUMNS).issubset(df.columns):
+        total_imports = df[
+            IMPORT_COLUMNS
+        ].sum(
+            axis=1,
+            min_count=1,
+        )
+
+        add(
+            "domain_total_import_peak_recorded",
+            True,
+            observed=(
+                f"max={total_imports.max(skipna=True):.6g}"
+            ),
+            expected="recorded",
+            severity="info",
+        )
+
+    if set(EXPORT_COLUMNS).issubset(df.columns):
+        total_exports = df[
+            EXPORT_COLUMNS
+        ].sum(
+            axis=1,
+            min_count=1,
+        )
+
         add(
             "domain_total_export_peak_recorded",
             True,
-            observed=f"max={total_exports.max(skipna=True):.6g}",
+            observed=(
+                f"max={total_exports.max(skipna=True):.6g}"
+            ),
             expected="recorded",
             severity="info",
         )

@@ -1,4 +1,4 @@
-# src/features/weather_features.py
+# src/feature_engineering/renewable_weather_features.py
 
 """
 Build hourly capacity-weighted weather features for Alberta wind and solar.
@@ -55,50 +55,115 @@ solar
 
 Outputs
 -------
-data/processed/weather/renewable_weather_features_hourly.parquet
-data/processed/weather/renewable_project_weather_mapping.csv
+data/features/weather/renewable_weather_features_hourly.parquet
+data/features/weather/renewable_project_weather_mapping.csv
 data/audits/weather_features_monthly_summary.csv
 data/audits/weather_features_audit_checks.csv
 
 Run
 ---
-python src/features/weather_features.py
+python src/feature_engineering/renewable_weather_features.py
 
 or:
 
-.venv/bin/python src/features/weather_features.py
+.venv/bin/python src/feature_engineering/renewable_weather_features.py
 """
 
 # Imports
 from __future__ import annotations
 import argparse
 import calendar
+import logging
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 import xarray as xr
 
 
+# ============================================================================
+# Logging
+# ============================================================================
+
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging(
+    verbose: bool = False,
+) -> None:
+    """Configure console logging for the pipeline."""
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+# ============================================================================
 # Paths
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+# ============================================================================
 
-ERA5_MONTHLY_DIR = (PROJECT_ROOT/ "data/preprocessing/weather/era5/monthly_standardized")
+# This file is expected to live at:
+#
+#     PROJECT_ROOT/src/feature_engineering/renewable_weather_features.py
+#
+# parents[0] -> feature_engineering
+# parents[1] -> src
+# parents[2] -> project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-WIND_PROJECTS_FILE = (PROJECT_ROOT/ "data/preprocessing/wind_projects_preprocessed.csv")
-SOLAR_PROJECTS_FILE = (PROJECT_ROOT/ "data/preprocessing/solar_projects_preprocessed.csv")
+PREPROCESSING_DIR = PROJECT_ROOT / "data" / "preprocessing"
+FEATURES_DIR = PROJECT_ROOT / "data" / "features"
+OUTPUT_DIR = FEATURES_DIR / "weather"
+AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
 
-OUTPUT_DIR = (PROJECT_ROOT/ "data/features/weather")
-OUTPUT_FILE = (OUTPUT_DIR/ "renewable_weather_features_hourly.parquet")
+ERA5_MONTHLY_DIR = (
+    PREPROCESSING_DIR
+    / "weather"
+    / "era5"
+    / "monthly_standardized"
+)
 
-PROJECT_MAPPING_FILE = (OUTPUT_DIR/ "renewable_project_weather_mapping.csv")
+WIND_PROJECTS_FILE = (
+    PREPROCESSING_DIR
+    / "wind_projects_preprocessed.csv"
+)
 
-AUDIT_DIR = PROJECT_ROOT / "data/audits"
+SOLAR_PROJECTS_FILE = (
+    PREPROCESSING_DIR
+    / "solar_projects_preprocessed.csv"
+)
 
-MONTHLY_SUMMARY_FILE = (AUDIT_DIR/ "weather_features_monthly_summary.csv")
+OUTPUT_PARQUET = (
+    OUTPUT_DIR
+    / "renewable_weather_features_hourly.parquet"
+)
 
-AUDIT_FILE = (AUDIT_DIR/ "weather_features_audit_checks.csv")
+OUTPUT_CSV = (
+    OUTPUT_DIR
+    / "renewable_weather_features_hourly.csv"
+)
+
+# Backward-compatible alias retained for code importing OUTPUT_FILE.
+OUTPUT_FILE = OUTPUT_PARQUET
+
+PROJECT_MAPPING_FILE = (
+    OUTPUT_DIR
+    / "renewable_project_weather_mapping.csv"
+)
+
+MONTHLY_SUMMARY_FILE = (
+    AUDIT_DIR
+    / "weather_features_monthly_summary.csv"
+)
+
+AUDIT_FILE = (
+    AUDIT_DIR
+    / "weather_features_audit_checks.csv"
+)
 
 
 # Configuration
@@ -1713,89 +1778,229 @@ def process_month(
 
 
 # ============================================================================
-# Full pipeline
+# Output and final-audit helpers
 # ============================================================================
 
-def build_weather_features() -> dict:
+def ensure_output_directories() -> None:
+    """Create feature and audit output directories."""
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def error_checks_pass(audit: pd.DataFrame) -> bool:
+    """Return True when all error-level audit checks pass."""
+
+    if audit.empty or "severity" not in audit.columns:
+        return True
+
+    checks = audit.loc[audit["severity"].eq("error"), "pass"]
+    return bool(checks.all()) if not checks.empty else True
+
+
+def audit_final_weather_features(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Run final checks on the concatenated hourly feature table."""
+
+    rows: list[dict] = []
+    timestamps = pd.DatetimeIndex(
+        pd.to_datetime(frame["timestamp_utc"], utc=True)
+    )
+
+    add_check(rows, "final", "row_count_positive", len(frame) > 0, len(frame), "> 0")
+    add_check(
+        rows,
+        "final",
+        "timestamps_unique",
+        not timestamps.has_duplicates,
+        int(timestamps.duplicated().sum()),
+        0,
+    )
+    add_check(
+        rows,
+        "final",
+        "timestamps_monotonic",
+        timestamps.is_monotonic_increasing,
+        timestamps.is_monotonic_increasing,
+        True,
+    )
+
+    if len(timestamps):
+        expected = pd.date_range(
+            timestamps.min(),
+            timestamps.max(),
+            freq="h",
+            tz="UTC",
+        )
+        missing = expected.difference(timestamps)
+    else:
+        missing = pd.DatetimeIndex([])
+
+    add_check(rows, "final", "hourly_continuity", len(missing) == 0, len(missing), 0)
+
+    required_columns = {
+        "timestamp_utc",
+        "wind_installed_capacity_mw",
+        "wind_active_project_count",
+        "wind_active_weather_site_count",
+        "solar_installed_capacity_mw",
+        "solar_active_project_count",
+        "solar_active_weather_site_count",
+    }
+    missing_columns = sorted(required_columns - set(frame.columns))
+    add_check(
+        rows,
+        "final",
+        "required_output_columns",
+        not missing_columns,
+        missing_columns,
+        [],
+    )
+
+    for fuel in ["wind", "solar"]:
+        capacity_column = f"{fuel}_installed_capacity_mw"
+        project_count_column = f"{fuel}_active_project_count"
+        site_count_column = f"{fuel}_active_weather_site_count"
+
+        if capacity_column in frame.columns:
+            negative = int((frame[capacity_column] < 0).sum())
+            add_check(rows, "final", f"{fuel}_capacity_non_negative", negative == 0, negative, 0)
+
+        if project_count_column in frame.columns:
+            negative = int((frame[project_count_column] < 0).sum())
+            add_check(rows, "final", f"{fuel}_project_count_non_negative", negative == 0, negative, 0)
+
+        if site_count_column in frame.columns:
+            negative = int((frame[site_count_column] < 0).sum())
+            add_check(rows, "final", f"{fuel}_site_count_non_negative", negative == 0, negative, 0)
+
+        if {project_count_column, site_count_column}.issubset(frame.columns):
+            invalid = int((frame[site_count_column] > frame[project_count_column]).sum())
+            add_check(rows, "final", f"{fuel}_site_count_not_above_project_count", invalid == 0, invalid, 0)
+
+    return pd.DataFrame(rows)
+
+
+def save_supporting_outputs(
+    project_mapping: pd.DataFrame,
+    monthly_summary: pd.DataFrame,
+    audit: pd.DataFrame,
+) -> None:
+    """Save mapping and audit outputs before canonical feature output."""
+
+    project_mapping.to_csv(PROJECT_MAPPING_FILE, index=False)
+    monthly_summary.to_csv(MONTHLY_SUMMARY_FILE, index=False)
+    audit.to_csv(AUDIT_FILE, index=False)
+
+    LOGGER.info("Saved project mapping: %s", PROJECT_MAPPING_FILE)
+    LOGGER.info("Saved monthly summary: %s", MONTHLY_SUMMARY_FILE)
+    LOGGER.info("Saved audit checks: %s", AUDIT_FILE)
+
+
+def save_feature_outputs(
+    frame: pd.DataFrame,
+    write_csv: bool,
+) -> None:
+    """Save canonical Parquet and optional CSV outputs."""
+
+    frame.to_parquet(OUTPUT_PARQUET, index=False)
+    LOGGER.info("Saved Parquet output: %s", OUTPUT_PARQUET)
+
+    if write_csv:
+        frame.to_csv(OUTPUT_CSV, index=False)
+        LOGGER.info("Saved CSV output: %s", OUTPUT_CSV)
+
+
+def existing_output_result(
+    write_csv: bool,
+) -> dict[str, Any] | None:
+    """Handle an existing canonical output without rebuilding NetCDF months."""
+
+    if not OUTPUT_PARQUET.exists():
+        return None
+
+    frame: pd.DataFrame | None = None
+
+    if write_csv and not OUTPUT_CSV.exists():
+        LOGGER.info("Parquet exists; creating the requested CSV without rebuilding features.")
+        frame = pd.read_parquet(OUTPUT_PARQUET)
+        frame.to_csv(OUTPUT_CSV, index=False)
+
+    if frame is None:
+        frame = pd.read_parquet(OUTPUT_PARQUET, columns=["timestamp_utc"])
+
+    timestamps = pd.to_datetime(frame["timestamp_utc"], utc=True)
+
+    return {
+        "dataset": "renewable_weather_features",
+        "status": "skipped_existing",
+        "pass": True,
+        "rows": len(frame),
+        "start": str(timestamps.min()),
+        "end": str(timestamps.max()),
+        "output_file": str(OUTPUT_PARQUET),
+        "output_csv": str(OUTPUT_CSV) if OUTPUT_CSV.exists() else None,
+    }
+
+
+# ============================================================================
+# Pipeline
+# ============================================================================
+
+def build_weather_features(
+    overwrite: bool = False,
+    write_csv: bool = False,
+) -> dict[str, Any]:
     """Run the complete renewable-weather feature pipeline."""
 
     pipeline_start = time.perf_counter()
+    ensure_output_directories()
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if not overwrite:
+        existing = existing_output_result(write_csv=write_csv)
+        if existing is not None:
+            return existing
 
-    AUDIT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    monthly_files = get_monthly_files(
-        ERA5_MONTHLY_DIR
-    )
-
+    monthly_files = get_monthly_files(ERA5_MONTHLY_DIR)
     projects = load_projects(
         wind_path=WIND_PROJECTS_FILE,
         solar_path=SOLAR_PROJECTS_FILE,
     )
 
-    latitudes, longitudes = load_grid(
-        monthly_files[0]
-    )
-
+    latitudes, longitudes = load_grid(monthly_files[0])
     project_mapping = map_projects_to_grid(
         projects=projects,
         latitudes=latitudes,
         longitudes=longitudes,
     )
 
-    project_mapping.to_csv(
-        PROJECT_MAPPING_FILE,
-        index=False,
+    LOGGER.info("Projects loaded: %s", f"{len(project_mapping):,}")
+    LOGGER.info("Wind projects: %s", f"{project_mapping['fuel_type'].eq('wind').sum():,}")
+    LOGGER.info("Solar projects: %s", f"{project_mapping['fuel_type'].eq('solar').sum():,}")
+    LOGGER.info(
+        "Maximum project-to-grid distance: %.2f km",
+        project_mapping["weather_distance_km"].max(),
     )
 
-    print(
-        f"Projects loaded: {len(project_mapping):,}"
-    )
-
-    print(
-        "Wind projects: "
-        f"{project_mapping['fuel_type'].eq('wind').sum():,}"
-    )
-
-    print(
-        "Solar projects: "
-        f"{project_mapping['fuel_type'].eq('solar').sum():,}"
-    )
-
-    print(
-        "Maximum project-to-grid distance: "
-        f"{project_mapping['weather_distance_km'].max():.2f} km"
-    )
-
-    monthly_outputs = []
-    monthly_summaries = []
-    monthly_audits = []
+    monthly_outputs: list[pd.DataFrame] = []
+    monthly_summaries: list[dict] = []
+    monthly_audits: list[pd.DataFrame] = []
 
     for path in monthly_files:
         period = monthly_file_period(path)
-
-        print(
-            f"Building renewable weather features for {period}"
-        )
+        LOGGER.info("Building renewable weather features for %s", period)
 
         try:
             features, summary, audit = process_month(
                 path=path,
                 project_mapping=project_mapping,
             )
-
             monthly_outputs.append(features)
             monthly_summaries.append(summary)
             monthly_audits.append(audit)
-
         except Exception as exc:
+            LOGGER.exception("Failed renewable-weather processing for %s", period)
             monthly_summaries.append(
                 {
                     "period": period,
@@ -1805,152 +2010,94 @@ def build_weather_features() -> dict:
                     "source_file": str(path),
                 }
             )
-
             monthly_audits.append(
                 pd.DataFrame(
-                    [
-                        {
-                            "period": period,
-                            "check": "process_month",
-                            "pass": False,
-                            "severity": "error",
-                            "observed": repr(exc),
-                            "expected": (
-                                "successful monthly weather "
-                                "feature construction"
-                            ),
-                            "notes": "",
-                        }
-                    ]
+                    [{
+                        "period": period,
+                        "check": "process_month",
+                        "pass": False,
+                        "severity": "error",
+                        "observed": repr(exc),
+                        "expected": "successful monthly weather feature construction",
+                        "notes": "",
+                    }]
                 )
             )
 
-    monthly_summary_df = pd.DataFrame(
-        monthly_summaries
-    )
-
-    monthly_summary_df.to_csv(
-        MONTHLY_SUMMARY_FILE,
-        index=False,
-    )
-
+    monthly_summary_df = pd.DataFrame(monthly_summaries)
     audit_df = (
-        pd.concat(
-            monthly_audits,
-            ignore_index=True,
-        )
+        pd.concat(monthly_audits, ignore_index=True)
         if monthly_audits
         else pd.DataFrame()
     )
 
-    audit_df.to_csv(
-        AUDIT_FILE,
-        index=False,
-    )
-
     if not monthly_outputs:
-        raise RuntimeError(
-            "No monthly weather-feature outputs were created."
-        )
+        save_supporting_outputs(project_mapping, monthly_summary_df, audit_df)
+        raise RuntimeError("No monthly weather-feature outputs were created.")
 
-    master = pd.concat(
-        monthly_outputs,
-        ignore_index=True,
-    )
-
-    master["timestamp_utc"] = pd.to_datetime(
-        master["timestamp_utc"],
-        utc=True,
-    )
-
+    master = pd.concat(monthly_outputs, ignore_index=True)
+    master["timestamp_utc"] = pd.to_datetime(master["timestamp_utc"], utc=True)
     master = (
         master
-        .drop_duplicates(
-            subset=["timestamp_utc"],
-            keep="last",
-        )
+        .drop_duplicates(subset=["timestamp_utc"], keep="last")
         .sort_values("timestamp_utc")
         .reset_index(drop=True)
     )
 
-    expected_index = pd.date_range(
-        start=master["timestamp_utc"].min(),
-        end=master["timestamp_utc"].max(),
-        freq="h",
-        tz="UTC",
-    )
+    final_audit = audit_final_weather_features(master)
+    audit_df = pd.concat([audit_df, final_audit], ignore_index=True)
+    overall_pass = error_checks_pass(audit_df)
 
-    missing_hours = expected_index.difference(
-        pd.DatetimeIndex(
-            master["timestamp_utc"]
-        )
-    )
+    save_supporting_outputs(project_mapping, monthly_summary_df, audit_df)
 
-    if len(missing_hours) > 0:
-        raise ValueError(
-            f"Final weather-feature table is missing "
-            f"{len(missing_hours):,} hourly timestamps."
-        )
+    if not overall_pass:
+        LOGGER.error("Renewable-weather audit failed; canonical feature outputs were not written.")
+        return {
+            "dataset": "renewable_weather_features",
+            "status": "audit_failed",
+            "pass": False,
+            "rows": len(master),
+            "columns": len(master.columns),
+            "project_mapping_file": str(PROJECT_MAPPING_FILE),
+            "monthly_summary_file": str(MONTHLY_SUMMARY_FILE),
+            "audit_file": str(AUDIT_FILE),
+            "processing_seconds": round(time.perf_counter() - pipeline_start, 3),
+        }
 
-    if master["timestamp_utc"].duplicated().any():
-        raise ValueError(
-            "Final weather-feature table contains duplicate timestamps."
-        )
+    save_feature_outputs(master, write_csv=write_csv)
 
-    master.to_parquet(
-        OUTPUT_FILE,
-        index=False,
-    )
-
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
-
-    overall_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
-
-    result = {
+    return {
         "dataset": "renewable_weather_features",
         "status": "saved",
-        "pass": overall_pass,
+        "pass": True,
         "rows": len(master),
         "columns": len(master.columns),
-        "start": str(
-            master["timestamp_utc"].min()
-        ),
-        "end": str(
-            master["timestamp_utc"].max()
-        ),
+        "start": str(master["timestamp_utc"].min()),
+        "end": str(master["timestamp_utc"].max()),
         "projects": len(project_mapping),
-        "wind_projects": int(
-            project_mapping[
-                "fuel_type"
-            ].eq("wind").sum()
-        ),
-        "solar_projects": int(
-            project_mapping[
-                "fuel_type"
-            ].eq("solar").sum()
-        ),
-        "output_file": str(OUTPUT_FILE),
-        "project_mapping_file": str(
-            PROJECT_MAPPING_FILE
-        ),
-        "monthly_summary_file": str(
-            MONTHLY_SUMMARY_FILE
-        ),
+        "wind_projects": int(project_mapping["fuel_type"].eq("wind").sum()),
+        "solar_projects": int(project_mapping["fuel_type"].eq("solar").sum()),
+        "maximum_project_grid_distance_km": float(project_mapping["weather_distance_km"].max()),
+        "output_file": str(OUTPUT_PARQUET),
+        "output_csv": str(OUTPUT_CSV) if write_csv else None,
+        "project_mapping_file": str(PROJECT_MAPPING_FILE),
+        "monthly_summary_file": str(MONTHLY_SUMMARY_FILE),
         "audit_file": str(AUDIT_FILE),
-        "processing_seconds": round(
-            time.perf_counter() - pipeline_start,
-            3,
-        ),
+        "processing_seconds": round(time.perf_counter() - pipeline_start, 3),
     }
 
-    return result
+
+def print_result(result: dict[str, Any]) -> None:
+    """Print a compact final pipeline report."""
+
+    print("\n" + "=" * 80)
+    print("RENEWABLE WEATHER FEATURE RESULT")
+    print("=" * 80)
+
+    for key, value in result.items():
+        print(f"{key}: {value}")
+
+    print("=" * 80)
 
 
 # ============================================================================
@@ -1964,19 +2111,38 @@ def main() -> None:
             "from spatial monthly ERA5 files."
         )
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Rebuild outputs even when the canonical Parquet already exists.",
+    )
+    parser.add_argument(
+        "--write-csv",
+        action="store_true",
+        help="Write a full CSV copy in addition to canonical Parquet.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG-level logging.",
+    )
 
-    parser.parse_args()
+    args = parser.parse_args()
+    configure_logging(verbose=args.verbose)
 
-    result = build_weather_features()
+    try:
+        result = build_weather_features(
+            overwrite=args.overwrite,
+            write_csv=args.write_csv,
+        )
+    except Exception:
+        LOGGER.exception("Renewable-weather feature pipeline failed.")
+        raise SystemExit(1)
 
-    print("\n" + "=" * 80)
-    print("RENEWABLE WEATHER FEATURE RESULT")
-    print("=" * 80)
+    print_result(result)
 
-    for key, value in result.items():
-        print(f"{key}: {value}")
-
-    print("=" * 80)
+    if not result.get("pass", False):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

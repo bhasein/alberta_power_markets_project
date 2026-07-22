@@ -48,6 +48,7 @@ Required regional load columns:
 Output
 ------
 data/features/weather/load_weather_features_hourly.parquet
+data/features/weather/load_weather_features_hourly.csv          optional
 data/features/weather/load_region_weather_mapping.csv
 data/audits/load_weather_features_monthly_summary.csv
 data/audits/load_weather_features_audit_checks.csv
@@ -57,9 +58,10 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import logging
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -67,44 +69,104 @@ import xarray as xr
 
 
 # ============================================================================
-# Paths
+# Logging
 # ============================================================================
 
-PROJECT_ROOT = Path(
-    "/Users/brodiehasein/alberta_power_markets_project"
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging(
+    verbose: bool = False,
+) -> None:
+    """
+    Configure console logging for the pipeline.
+
+    INFO is used by default. DEBUG can be enabled with --verbose.
+    """
+
+    logging.basicConfig(
+        level=(
+            logging.DEBUG
+            if verbose
+            else logging.INFO
+        ),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+# ============================================================================
+# Project paths
+# ============================================================================
+
+# This file is expected to live at:
+#
+#     PROJECT_ROOT/src/feature_engineering/load_weather_features.py
+#
+# parents[0] -> feature_engineering
+# parents[1] -> src
+# parents[2] -> project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+PREPROCESSING_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "preprocessing"
 )
 
 ERA5_MONTHLY_DIR = (
-    PROJECT_ROOT
-    / "data/preprocessing/weather/era5/monthly_standardized"
+    PREPROCESSING_DIR
+    / "weather"
+    / "era5"
+    / "monthly_standardized"
 )
 
 AREA_LOAD_FILE = (
-    PROJECT_ROOT
-    / "data/preprocessing/area_load_preprocessed.parquet"
+    PREPROCESSING_DIR
+    / "area_load_preprocessed.parquet"
 )
 
 LOAD_REGIONS_FILE = (
+    PREPROCESSING_DIR
+    / "load_regions.csv"
+)
+
+FEATURES_DIR = (
     PROJECT_ROOT
-    / "data/preprocessing/load_regions.csv"
+    / "data"
+    / "features"
 )
 
 OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "data/features/weather"
+    FEATURES_DIR
+    / "weather"
 )
 
-OUTPUT_FILE = (
+OUTPUT_PARQUET = (
     OUTPUT_DIR
     / "load_weather_features_hourly.parquet"
 )
+
+OUTPUT_CSV = (
+    OUTPUT_DIR
+    / "load_weather_features_hourly.csv"
+)
+
+# Backward-compatible alias retained for any external imports that still
+# reference OUTPUT_FILE.
+OUTPUT_FILE = OUTPUT_PARQUET
 
 LOAD_REGION_MAPPING_FILE = (
     OUTPUT_DIR
     / "load_region_weather_mapping.csv"
 )
 
-AUDIT_DIR = PROJECT_ROOT / "data/audits"
+AUDIT_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "audits"
+)
 
 MONTHLY_SUMMARY_FILE = (
     AUDIT_DIR
@@ -120,6 +182,9 @@ AUDIT_FILE = (
 # ============================================================================
 # Configuration
 # ============================================================================
+
+DATASET_NAME = "load_weather_features"
+TIMEZONE = "America/Edmonton"
 
 REGION_LOAD_COLUMNS = {
     "calgary": "calgary_load_mw",
@@ -191,6 +256,20 @@ SOURCE_VARIABLES = [
 # ============================================================================
 # General helpers
 # ============================================================================
+
+def ensure_output_directories() -> None:
+    """Create feature and audit output directories if they do not exist."""
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    AUDIT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
 
 def add_check(
     rows: list[dict],
@@ -1803,7 +1882,7 @@ def add_local_time_reference_features(
             "timestamp_utc"
         ]
         .dt.tz_convert(
-            "America/Edmonton"
+            TIMEZONE
         )
     )
 
@@ -2175,28 +2254,600 @@ def process_month(
 
 
 # ============================================================================
+# Final audit and output helpers
+# ============================================================================
+
+def audit_master_output(
+    master: pd.DataFrame,
+) -> tuple[
+    pd.DataFrame,
+    bool,
+]:
+    """
+    Audit the assembled feature table after all reusable builders are applied.
+
+    Month-level checks validate each source file. These final checks validate
+    the canonical table as one continuous output.
+    """
+
+    rows: list[dict[str, Any]] = []
+    period = "final"
+
+    timestamp_index = pd.DatetimeIndex(
+        pd.to_datetime(
+            master["timestamp_utc"],
+            utc=True,
+        )
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_row_count_positive",
+        len(master) > 0,
+        observed=len(master),
+        expected="> 0",
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_timestamps_unique",
+        timestamp_index.is_unique,
+        observed=int(
+            timestamp_index
+            .duplicated()
+            .sum()
+        ),
+        expected=0,
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_timestamps_monotonic",
+        timestamp_index.is_monotonic_increasing,
+        observed=timestamp_index.is_monotonic_increasing,
+        expected=True,
+    )
+
+    if len(timestamp_index) > 1:
+        bad_spacing = int(
+            pd.Series(timestamp_index)
+            .diff()
+            .dropna()
+            .ne(
+                pd.Timedelta(hours=1)
+            )
+            .sum()
+        )
+    else:
+        bad_spacing = 0
+
+    add_check(
+        rows,
+        period,
+        "final_hourly_spacing",
+        bad_spacing == 0,
+        observed=bad_spacing,
+        expected=0,
+    )
+
+    if len(timestamp_index) > 0:
+        expected_index = pd.date_range(
+            start=timestamp_index.min(),
+            end=timestamp_index.max(),
+            freq="h",
+            tz="UTC",
+        )
+
+        missing_hours = expected_index.difference(
+            timestamp_index
+        )
+
+        extra_hours = timestamp_index.difference(
+            expected_index
+        )
+    else:
+        missing_hours = pd.DatetimeIndex([])
+        extra_hours = pd.DatetimeIndex([])
+
+    add_check(
+        rows,
+        period,
+        "final_missing_hours",
+        len(missing_hours) == 0,
+        observed=len(missing_hours),
+        expected=0,
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_extra_hours",
+        len(extra_hours) == 0,
+        observed=len(extra_hours),
+        expected=0,
+    )
+
+    required_columns = {
+        "timestamp_utc",
+        "total_region_load_mw",
+        "area_load_imputed",
+        "load_weighted_temperature_2m",
+        "load_weighted_temperature_c",
+        "hour_alberta",
+        "month_alberta",
+        *REGION_LOAD_COLUMNS.values(),
+    }
+
+    missing_columns = sorted(
+        required_columns
+        - set(master.columns)
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_required_columns_present",
+        not missing_columns,
+        observed=(
+            "; ".join(missing_columns)
+            if missing_columns
+            else "all present"
+        ),
+        expected="all required columns present",
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_timestamp_timezone",
+        str(master["timestamp_utc"].dtype).endswith(", UTC]"),
+        observed=str(master["timestamp_utc"].dtype),
+        expected="datetime64[*, UTC]",
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_load_values_complete",
+        not master[
+            [
+                *REGION_LOAD_COLUMNS.values(),
+                "total_region_load_mw",
+                "area_load_imputed",
+            ]
+        ]
+        .isna()
+        .any()
+        .any(),
+        observed=int(
+            master[
+                [
+                    *REGION_LOAD_COLUMNS.values(),
+                    "total_region_load_mw",
+                    "area_load_imputed",
+                ]
+            ]
+            .isna()
+            .sum()
+            .sum()
+        ),
+        expected=0,
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_total_region_load_positive",
+        master["total_region_load_mw"]
+        .gt(0)
+        .all(),
+        observed=int(
+            master["total_region_load_mw"]
+            .le(0)
+            .sum()
+        ),
+        expected=0,
+    )
+
+    share_columns = [
+        f"{region}_load_share"
+        for region in REGION_LOAD_COLUMNS
+    ]
+
+    if set(share_columns).issubset(master.columns):
+        share_sum = master[
+            share_columns
+        ].sum(axis=1)
+
+        maximum_share_error = float(
+            np.abs(
+                share_sum - 1.0
+            ).max()
+        )
+
+        add_check(
+            rows,
+            period,
+            "final_regional_load_shares_sum_to_one",
+            np.allclose(
+                share_sum,
+                1.0,
+                atol=1e-6,
+            ),
+            observed=(
+                f"max_abs_error="
+                f"{maximum_share_error:.6g}"
+            ),
+            expected="0",
+        )
+
+        add_check(
+            rows,
+            period,
+            "final_regional_load_shares_nonnegative",
+            not master[
+                share_columns
+            ]
+            .lt(0)
+            .any()
+            .any(),
+            observed=int(
+                master[
+                    share_columns
+                ]
+                .lt(0)
+                .sum()
+                .sum()
+            ),
+            expected=0,
+        )
+
+    add_check(
+        rows,
+        period,
+        "final_valid_hour_alberta",
+        master["hour_alberta"]
+        .between(0, 23)
+        .all(),
+        observed=(
+            f"min={master['hour_alberta'].min()}, "
+            f"max={master['hour_alberta'].max()}"
+        ),
+        expected="[0, 23]",
+    )
+
+    add_check(
+        rows,
+        period,
+        "final_valid_month_alberta",
+        master["month_alberta"]
+        .between(1, 12)
+        .all(),
+        observed=(
+            f"min={master['month_alberta'].min()}, "
+            f"max={master['month_alberta'].max()}"
+        ),
+        expected="[1, 12]",
+    )
+
+    audit = pd.DataFrame(rows)
+
+    error_checks = audit.loc[
+        audit["severity"].eq("error"),
+        "pass",
+    ]
+
+    audit_pass = (
+        bool(error_checks.all())
+        if not error_checks.empty
+        else True
+    )
+
+    return (
+        audit,
+        audit_pass,
+    )
+
+
+def save_supporting_outputs(
+    mapping: pd.DataFrame,
+    monthly_summary: pd.DataFrame,
+    audit: pd.DataFrame,
+) -> None:
+    """Write the spatial mapping, monthly summary, and complete audit."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing load-region weather mapping to %s.",
+        LOAD_REGION_MAPPING_FILE,
+    )
+
+    mapping.to_csv(
+        LOAD_REGION_MAPPING_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing monthly processing summary to %s.",
+        MONTHLY_SUMMARY_FILE,
+    )
+
+    monthly_summary.to_csv(
+        MONTHLY_SUMMARY_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing load-weather audit checks to %s.",
+        AUDIT_FILE,
+    )
+
+    audit.to_csv(
+        AUDIT_FILE,
+        index=False,
+    )
+
+
+def save_feature_outputs(
+    master: pd.DataFrame,
+    write_csv: bool,
+) -> None:
+    """Write the canonical Parquet and optional CSV feature outputs."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing canonical load-weather Parquet to %s.",
+        OUTPUT_PARQUET,
+    )
+
+    master.to_parquet(
+        OUTPUT_PARQUET,
+        index=False,
+    )
+
+    if write_csv:
+        LOGGER.info(
+            "Writing optional load-weather CSV to %s.",
+            OUTPUT_CSV,
+        )
+
+        master.to_csv(
+            OUTPUT_CSV,
+            index=False,
+        )
+
+
+def existing_outputs_satisfy_request(
+    write_csv: bool,
+) -> bool:
+    """
+    Return True when all requested canonical feature outputs already exist.
+
+    Parquet is always required. CSV is required only when write_csv=True.
+    """
+
+    return (
+        OUTPUT_PARQUET.exists()
+        and (
+            OUTPUT_CSV.exists()
+            if write_csv
+            else True
+        )
+    )
+
+
+def read_existing_parquet_for_csv() -> pd.DataFrame:
+    """
+    Load the existing canonical Parquet when only the optional CSV is missing.
+
+    This avoids repeating the expensive month-by-month NetCDF extraction.
+    """
+
+    LOGGER.info(
+        "Loading existing load-weather Parquet from %s.",
+        OUTPUT_PARQUET,
+    )
+
+    master = pd.read_parquet(
+        OUTPUT_PARQUET
+    )
+
+    if "timestamp_utc" in master.columns:
+        master["timestamp_utc"] = pd.to_datetime(
+            master["timestamp_utc"],
+            utc=True,
+        )
+
+    return master
+
+
+# ============================================================================
+# Reporting
+# ============================================================================
+
+def print_pipeline_report(
+    result: dict[str, Any],
+) -> None:
+    """Print a compact final pipeline result."""
+
+    print(
+        "\n"
+        + "=" * 80
+    )
+
+    print(
+        "LOAD WEATHER FEATURE RESULT"
+    )
+
+    print(
+        "=" * 80
+    )
+
+    for key, value in result.items():
+        print(
+            f"{key}: {value}"
+        )
+
+    print(
+        "=" * 80
+    )
+
+
+# ============================================================================
 # Full pipeline
 # ============================================================================
 
-def build_load_weather_features() -> dict:
+def build_load_weather_features(
+    overwrite: bool = False,
+    write_csv: bool = False,
+) -> dict[str, Any]:
+    """
+    Build, audit, and save canonical hourly load-weather features.
+
+    The expensive ERA5 extraction is skipped when all requested canonical
+    outputs already exist and overwrite=False.
+    """
+
     started = time.perf_counter()
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    LOGGER.info("Starting load-weather feature pipeline.")
+    LOGGER.debug("Project root: %s", PROJECT_ROOT)
+    LOGGER.debug("ERA5 monthly directory: %s", ERA5_MONTHLY_DIR)
+    LOGGER.debug("Area-load input: %s", AREA_LOAD_FILE)
+    LOGGER.debug("Feature output directory: %s", OUTPUT_DIR)
+    LOGGER.debug("Audit output directory: %s", AUDIT_DIR)
 
-    AUDIT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    ensure_output_directories()
+
+    # ------------------------------------------------------------------------
+    # Existing-output handling
+    # ------------------------------------------------------------------------
+
+    if (
+        not overwrite
+        and existing_outputs_satisfy_request(
+            write_csv=write_csv
+        )
+    ):
+        LOGGER.info(
+            "Requested feature outputs already exist. "
+            "Use --overwrite to rebuild them."
+        )
+
+        return {
+            "dataset": DATASET_NAME,
+            "status": "skipped_existing",
+            "pass": True,
+            "rows": None,
+            "columns": None,
+            "parquet_file": str(OUTPUT_PARQUET),
+            "csv_file": (
+                str(OUTPUT_CSV)
+                if write_csv
+                else "not requested"
+            ),
+            "mapping_file": (
+                str(LOAD_REGION_MAPPING_FILE)
+                if LOAD_REGION_MAPPING_FILE.exists()
+                else "not available"
+            ),
+            "monthly_summary_file": (
+                str(MONTHLY_SUMMARY_FILE)
+                if MONTHLY_SUMMARY_FILE.exists()
+                else "not available"
+            ),
+            "audit_file": (
+                str(AUDIT_FILE)
+                if AUDIT_FILE.exists()
+                else "not available"
+            ),
+            "processing_seconds": round(
+                time.perf_counter()
+                - started,
+                3,
+            ),
+        }
+
+    # Create a missing CSV directly from the canonical Parquet rather than
+    # repeating all NetCDF extraction and monthly weighting.
+    if (
+        not overwrite
+        and OUTPUT_PARQUET.exists()
+        and write_csv
+        and not OUTPUT_CSV.exists()
+    ):
+        master = read_existing_parquet_for_csv()
+
+        LOGGER.info(
+            "Creating missing CSV from existing canonical Parquet."
+        )
+
+        master.to_csv(
+            OUTPUT_CSV,
+            index=False,
+        )
+
+        return {
+            "dataset": DATASET_NAME,
+            "status": "csv_created_from_existing_parquet",
+            "pass": True,
+            "rows": len(master),
+            "columns": len(master.columns),
+            "start_utc": str(
+                master["timestamp_utc"].min()
+            ),
+            "end_utc": str(
+                master["timestamp_utc"].max()
+            ),
+            "parquet_file": str(OUTPUT_PARQUET),
+            "csv_file": str(OUTPUT_CSV),
+            "mapping_file": (
+                str(LOAD_REGION_MAPPING_FILE)
+                if LOAD_REGION_MAPPING_FILE.exists()
+                else "not available"
+            ),
+            "monthly_summary_file": (
+                str(MONTHLY_SUMMARY_FILE)
+                if MONTHLY_SUMMARY_FILE.exists()
+                else "not available"
+            ),
+            "audit_file": (
+                str(AUDIT_FILE)
+                if AUDIT_FILE.exists()
+                else "not available"
+            ),
+            "processing_seconds": round(
+                time.perf_counter()
+                - started,
+                3,
+            ),
+        }
+
+    # ------------------------------------------------------------------------
+    # Inputs and spatial mapping
+    # ------------------------------------------------------------------------
 
     monthly_files = get_monthly_files(
         ERA5_MONTHLY_DIR
     )
 
+    LOGGER.info(
+        "Found %s monthly ERA5 files.",
+        f"{len(monthly_files):,}",
+    )
+
     hourly_load = load_hourly_area_load(
         AREA_LOAD_FILE
+    )
+
+    LOGGER.info(
+        "Loaded AESO hourly regional load with %s rows.",
+        f"{len(hourly_load):,}",
     )
 
     regions = load_load_regions(
@@ -2216,42 +2867,44 @@ def build_load_weather_features() -> dict:
         longitudes,
     )
 
-    mapping.to_csv(
-        LOAD_REGION_MAPPING_FILE,
-        index=False,
+    LOGGER.info(
+        "Mapped %s load regions to %s unique ERA5 sites.",
+        f"{len(mapping):,}",
+        f"{mapping['weather_site_id'].nunique():,}",
     )
 
-    print(
-        f"Load regions: {len(mapping):,}"
+    LOGGER.info(
+        "AESO load coverage: %s through %s.",
+        hourly_load["timestamp_utc"].min(),
+        hourly_load["timestamp_utc"].max(),
     )
 
-    print(
-        "AESO load coverage: "
-        f"{hourly_load['timestamp_utc'].min()} "
-        f"to {hourly_load['timestamp_utc'].max()}"
+    LOGGER.info(
+        "Maximum region-to-grid distance: %.2f km.",
+        mapping["weather_distance_km"].max(),
     )
 
-    print(
-        "Maximum region-to-grid distance: "
-        f"{mapping['weather_distance_km'].max():.2f} km"
+    LOGGER.info(
+        "Location source: %s.",
+        mapping["location_source"].iloc[0],
     )
 
-    print(
-        "Location source: "
-        f"{mapping['location_source'].iloc[0]}"
-    )
+    # ------------------------------------------------------------------------
+    # Month-by-month processing
+    # ------------------------------------------------------------------------
 
-    outputs = []
-    summaries = []
-    audits = []
+    outputs: list[pd.DataFrame] = []
+    summaries: list[dict[str, Any]] = []
+    audits: list[pd.DataFrame] = []
 
     for path in monthly_files:
         period = monthly_file_period(
             path
         )
 
-        print(
-            f"Building load weather base for {period}"
+        LOGGER.info(
+            "Building load-weather base for %s.",
+            period,
         )
 
         try:
@@ -2278,16 +2931,29 @@ def build_load_weather_features() -> dict:
                 audit
             )
 
+            LOGGER.info(
+                "Completed %s with status=%s, rows=%s, pass=%s.",
+                period,
+                summary.get("status"),
+                f"{summary.get('rows', 0):,}",
+                summary.get("pass"),
+            )
+
         except Exception as exc:
+            LOGGER.exception(
+                "Failed load-weather processing for %s.",
+                period,
+            )
+
             summaries.append(
                 {
                     "period": period,
                     "status": "error",
                     "pass": False,
+                    "rows": 0,
+                    "columns": 0,
                     "error": repr(exc),
-                    "source_file": str(
-                        path
-                    ),
+                    "source_file": str(path),
                 }
             )
 
@@ -2299,9 +2965,7 @@ def build_load_weather_features() -> dict:
                             "check": "process_month",
                             "pass": False,
                             "severity": "error",
-                            "observed": repr(
-                                exc
-                            ),
+                            "observed": repr(exc),
                             "expected": (
                                 "successful monthly "
                                 "load-weather construction"
@@ -2316,49 +2980,67 @@ def build_load_weather_features() -> dict:
         summaries
     )
 
-    monthly_summary_df.to_csv(
-        MONTHLY_SUMMARY_FILE,
-        index=False,
-    )
-
-    audit_df = (
+    monthly_audit_df = (
         pd.concat(
             audits,
             ignore_index=True,
         )
         if audits
-        else pd.DataFrame()
-    )
-
-    audit_df.to_csv(
-        AUDIT_FILE,
-        index=False,
+        else pd.DataFrame(
+            columns=[
+                "period",
+                "check",
+                "pass",
+                "severity",
+                "observed",
+                "expected",
+                "notes",
+            ]
+        )
     )
 
     if not outputs:
+        save_supporting_outputs(
+            mapping=mapping,
+            monthly_summary=monthly_summary_df,
+            audit=monthly_audit_df,
+        )
+
         raise RuntimeError(
             "No monthly load-weather outputs were created."
         )
+
+    # ------------------------------------------------------------------------
+    # Canonical table assembly
+    # ------------------------------------------------------------------------
 
     master = pd.concat(
         outputs,
         ignore_index=True,
     )
 
-    master[
-        "timestamp_utc"
-    ] = pd.to_datetime(
-        master[
-            "timestamp_utc"
-        ],
+    master["timestamp_utc"] = pd.to_datetime(
+        master["timestamp_utc"],
         utc=True,
     )
+
+    duplicate_count_before = int(
+        master["timestamp_utc"]
+        .duplicated()
+        .sum()
+    )
+
+    if duplicate_count_before:
+        LOGGER.warning(
+            "Dropping %s duplicate timestamps before final validation.",
+            f"{duplicate_count_before:,}",
+        )
 
     master = (
         master
         .drop_duplicates(
             subset=[
-                "timestamp_utc"
+                "timestamp_utc",
             ],
             keep="last",
         )
@@ -2370,90 +3052,138 @@ def build_load_weather_features() -> dict:
         )
     )
 
-    expected = pd.date_range(
-        master[
-            "timestamp_utc"
-        ].min(),
-        master[
-            "timestamp_utc"
-        ].max(),
-        freq="h",
-        tz="UTC",
-    )
-
-    missing = expected.difference(
-        pd.DatetimeIndex(
-            master[
-                "timestamp_utc"
-            ]
-        )
-    )
-
-    if len(missing):
-        raise ValueError(
-            "Final load-weather table is missing "
-            f"{len(missing):,} hourly timestamps."
-        )
-
-    if master[
-        "timestamp_utc"
-    ].duplicated().any():
-        raise ValueError(
-            "Final load-weather table contains duplicate timestamps."
-        )
-
+    # Apply reusable builders only after all processed months are concatenated.
+    #
+    # This is important for lagged and rolling temperature features because it
+    # allows them to flow continuously across month boundaries.
     master = apply_feature_builders(
         master
     )
 
-    master.to_parquet(
-        OUTPUT_FILE,
-        index=False,
+    final_audit_df, final_audit_pass = audit_master_output(
+        master
+    )
+
+    audit_df = pd.concat(
+        [
+            monthly_audit_df,
+            final_audit_df,
+        ],
+        ignore_index=True,
     )
 
     error_checks = audit_df.loc[
-        audit_df[
-            "severity"
-        ].eq(
-            "error"
-        ),
+        audit_df["severity"].eq("error"),
         "pass",
     ]
 
     overall_pass = (
-        bool(
-            error_checks.all()
-        )
+        bool(error_checks.all())
         if not error_checks.empty
         else True
     )
 
+    # Always save the mapping and audit evidence, including after a failed run.
+    save_supporting_outputs(
+        mapping=mapping,
+        monthly_summary=monthly_summary_df,
+        audit=audit_df,
+    )
+
+    if not overall_pass or not final_audit_pass:
+        LOGGER.error(
+            "Load-weather audit failed. Canonical feature outputs were not written."
+        )
+
+        return {
+            "dataset": DATASET_NAME,
+            "status": "audit_failed",
+            "pass": False,
+            "rows": len(master),
+            "columns": len(master.columns),
+            "start_utc": str(
+                master["timestamp_utc"].min()
+            ),
+            "end_utc": str(
+                master["timestamp_utc"].max()
+            ),
+            "load_regions": len(mapping),
+            "imputed_load_hours": int(
+                master["area_load_imputed"].sum()
+            ),
+            "parquet_file": "not written",
+            "csv_file": "not written",
+            "mapping_file": str(
+                LOAD_REGION_MAPPING_FILE
+            ),
+            "monthly_summary_file": str(
+                MONTHLY_SUMMARY_FILE
+            ),
+            "audit_file": str(
+                AUDIT_FILE
+            ),
+            "processing_seconds": round(
+                time.perf_counter()
+                - started,
+                3,
+            ),
+        }
+
+    # ------------------------------------------------------------------------
+    # Canonical feature output
+    # ------------------------------------------------------------------------
+
+    save_feature_outputs(
+        master,
+        write_csv=write_csv,
+    )
+
+    processing_seconds = round(
+        time.perf_counter()
+        - started,
+        3,
+    )
+
+    LOGGER.info(
+        "Load-weather feature pipeline completed successfully in %.3f seconds.",
+        processing_seconds,
+    )
+
     return {
-        "dataset": "load_weather_features",
+        "dataset": DATASET_NAME,
         "status": "saved",
-        "pass": overall_pass,
+        "pass": True,
         "rows": len(master),
         "columns": len(master.columns),
-        "start": str(
-            master[
-                "timestamp_utc"
-            ].min()
+        "start_utc": str(
+            master["timestamp_utc"].min()
         ),
-        "end": str(
-            master[
-                "timestamp_utc"
-            ].max()
+        "end_utc": str(
+            master["timestamp_utc"].max()
         ),
-        "load_regions": len(
-            mapping
+        "load_regions": len(mapping),
+        "weather_sites": int(
+            mapping["weather_site_id"]
+            .nunique()
+        ),
+        "maximum_region_grid_distance_km": round(
+            float(
+                mapping["weather_distance_km"]
+                .max()
+            ),
+            3,
         ),
         "imputed_load_hours": int(
-            master[
-                "area_load_imputed"
-            ].sum()
+            master["area_load_imputed"]
+            .sum()
         ),
-        "output_file": str(
-            OUTPUT_FILE
+        "parquet_file": str(
+            OUTPUT_PARQUET
+        ),
+        "csv_file": (
+            str(OUTPUT_CSV)
+            if write_csv
+            else "not requested"
         ),
         "mapping_file": str(
             LOAD_REGION_MAPPING_FILE
@@ -2464,11 +3194,7 @@ def build_load_weather_features() -> dict:
         "audit_file": str(
             AUDIT_FILE
         ),
-        "processing_seconds": round(
-            time.perf_counter()
-            - started,
-            3,
-        ),
+        "processing_seconds": processing_seconds,
     }
 
 
@@ -2476,7 +3202,9 @@ def build_load_weather_features() -> dict:
 # CLI
 # ============================================================================
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Create the command-line argument parser."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Build Alberta load-relevant weather features "
@@ -2484,23 +3212,66 @@ def main() -> None:
         )
     )
 
-    parser.parse_args()
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Rebuild and overwrite existing load-weather feature outputs."
+        ),
+    )
 
-    result = build_load_weather_features()
+    parser.add_argument(
+        "--write-csv",
+        action="store_true",
+        help=(
+            "Also write the full load-weather feature table to CSV."
+        ),
+    )
 
-    print("\n" + "=" * 80)
-    print("LOAD WEATHER FEATURE RESULT")
-    print("=" * 80)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable verbose DEBUG-level logging."
+        ),
+    )
 
-    for (
-        key,
-        value,
-    ) in result.items():
-        print(
-            f"{key}: {value}"
+    return parser
+
+
+def main() -> None:
+    """Run the load-weather feature pipeline from the command line."""
+
+    parser = build_argument_parser()
+
+    args = parser.parse_args()
+
+    configure_logging(
+        verbose=args.verbose
+    )
+
+    try:
+        result = build_load_weather_features(
+            overwrite=args.overwrite,
+            write_csv=args.write_csv,
         )
 
-    print("=" * 80)
+    except Exception:
+        LOGGER.exception(
+            "Load-weather feature pipeline terminated "
+            "with an unexpected error."
+        )
+        raise
+
+    print_pipeline_report(
+        result
+    )
+
+    if not result.get(
+        "pass",
+        False,
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
