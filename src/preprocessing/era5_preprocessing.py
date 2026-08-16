@@ -1,7 +1,17 @@
-# src/preprocessing/era5_preprocessing.py
+"""Standardize and audit monthly ERA5 weather grids for Alberta.
+
+Raw single- and pressure-level NetCDF files are merged into one canonical
+hourly monthly dataset. Full audits validate file presence, grid geometry,
+timeline, variables, and meteorological ranges; quick audits retain only the
+structural checks and write to separate evidence files.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
 import argparse
 import calendar
+import sys
 import time
 import zipfile
 
@@ -9,24 +19,41 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+from config import (
+    PROJECT_ROOT,
+    ERA5_RAW_DIR,
+    ERA5_SINGLE_LEVEL_DIR as SINGLE_DIR,
+    ERA5_PRESSURE_LEVEL_DIR as PRESSURE_DIR,
+    ERA5_PREPROCESSING_DIR as PREPROCESSING_DIR,
+    ERA5_MONTHLY_STANDARDIZED_DIR as MONTHLY_NC_DIR,
+    PREPROCESSING_AUDITS_DIR as AUDIT_DIR,
+    PIPELINE_START_YEAR as START_YEAR,
+    PIPELINE_END_YEAR as END_YEAR,
+    PIPELINE_END_MONTH as END_MONTH,
+)
+from preprocessing.shared import (
+    add_check as append_audit_check,
+    audit_passes,
+    build_manifest,
+    outputs_are_current,
+    preprocessing_code_paths,
+    write_audit_artifacts,
+    write_manifests,
+)
 
-RAW_ERA5_DIR = PROJECT_ROOT / "data/raw/weather/era5"
-SINGLE_DIR = RAW_ERA5_DIR / "single_levels"
-PRESSURE_DIR = RAW_ERA5_DIR / "pressure_levels"
-
-PREPROCESSING_DIR = PROJECT_ROOT / "data/preprocessing/weather/era5"
-MONTHLY_NC_DIR = PREPROCESSING_DIR / "monthly_standardized"
-
-AUDIT_DIR = PROJECT_ROOT / "data/audits"
 AUDIT_FILE = AUDIT_DIR / "era5_preprocessing_audit_checks.csv"
 MONTHLY_SUMMARY_FILE = AUDIT_DIR / "era5_preprocessing_monthly_summary.csv"
 FEATURE_SUMMARY_FILE = AUDIT_DIR / "era5_preprocessing_feature_summary.csv"
-
-START_YEAR = 2015
-END_YEAR = 2026
-END_MONTH = 6
+QUICK_AUDIT_FILE = AUDIT_DIR / "era5_preprocessing_quick_audit_checks.csv"
+QUICK_MONTHLY_SUMMARY_FILE = (
+    AUDIT_DIR / "era5_preprocessing_quick_monthly_summary.csv"
+)
+QUICK_FEATURE_SUMMARY_FILE = (
+    AUDIT_DIR / "era5_preprocessing_quick_feature_summary.csv"
+)
 
 EXPECTED_LAT_COUNT = 47
 EXPECTED_LON_COUNT = 47
@@ -142,10 +169,14 @@ for var in EXPECTED_VARIABLES:
 
 
 def expected_hours(year: int, month: int) -> int:
+    """Return the number of hourly records expected in a calendar month."""
+
     return calendar.monthrange(year, month)[1] * 24
 
 
 def months_range(start_year: int, end_year: int, end_month: int):
+    """Yield configured ``(year, month)`` pairs in chronological order."""
+
     for year in range(start_year, end_year + 1):
         last_month = end_month if year == end_year else 12
         for month in range(1, last_month + 1):
@@ -153,18 +184,23 @@ def months_range(start_year: int, end_year: int, end_month: int):
 
 
 def add_check(rows, period, check, passed, observed=None, expected=None, severity="error", notes=""):
-    rows.append({
-        "period": period,
-        "check": check,
-        "pass": bool(passed),
-        "severity": severity,
-        "observed": observed,
-        "expected": expected,
-        "notes": notes,
-    })
+    """Append one period-aware ERA5 audit result."""
+
+    append_audit_check(
+        rows,
+        check,
+        passed,
+        observed,
+        expected,
+        severity,
+        notes,
+        period=period,
+    )
 
 
 def standardize_dims(ds: xr.Dataset) -> xr.Dataset:
+    """Normalize ERA5 coordinate names and ordering."""
+
     rename = {}
 
     if "valid_time" in ds.dims or "valid_time" in ds.coords:
@@ -187,10 +223,14 @@ def standardize_dims(ds: xr.Dataset) -> xr.Dataset:
 
 
 def open_nc(path: Path) -> xr.Dataset:
+    """Open one required NetCDF source file."""
+
     return standardize_dims(xr.open_dataset(path))
 
 
 def ensure_single_folder(year: int, month: int) -> Path:
+    """Return the extracted single-level folder, extracting its ZIP if needed."""
+
     year_s = str(year)
     month_s = f"{month:02d}"
 
@@ -210,6 +250,8 @@ def ensure_single_folder(year: int, month: int) -> Path:
 
 
 def pressure_path(year: int, month: int, level: str) -> Path:
+    """Return the configured pressure-level file for one month and level."""
+
     return PRESSURE_DIR / PRESSURE_FILES[level].format(
         year=str(year),
         month=f"{month:02d}",
@@ -217,6 +259,8 @@ def pressure_path(year: int, month: int, level: str) -> Path:
 
 
 def raw_files_for_month(year: int, month: int) -> list[Path]:
+    """Return every raw file required to build one standardized month."""
+
     folder = ensure_single_folder(year, month)
 
     files = [folder / f for f in SINGLE_FILES]
@@ -230,6 +274,8 @@ def raw_files_for_month(year: int, month: int) -> list[Path]:
 
 
 def audit_raw_files(year: int, month: int) -> pd.DataFrame:
+    """Audit presence and readability of one month's raw source files."""
+
     period = f"{year}-{month:02d}"
     rows = []
 
@@ -263,6 +309,8 @@ def audit_raw_files(year: int, month: int) -> pd.DataFrame:
 
 
 def load_single_levels(year: int, month: int) -> xr.Dataset:
+    """Load and merge the single-level ERA5 variables for one month."""
+
     folder = ensure_single_folder(year, month)
 
     missing = [f for f in SINGLE_FILES if not (folder / f).exists()]
@@ -281,6 +329,8 @@ def load_single_levels(year: int, month: int) -> xr.Dataset:
 
 
 def load_pressure_level(year: int, month: int, level: str) -> xr.Dataset:
+    """Load and standardize one pressure-level ERA5 dataset."""
+
     path = pressure_path(year, month, level)
 
     if not path.exists():
@@ -309,6 +359,8 @@ def load_pressure_level(year: int, month: int, level: str) -> xr.Dataset:
 
 
 def build_month_dataset(year: int, month: int) -> xr.Dataset:
+    """Merge all required ERA5 inputs into one standardized monthly dataset."""
+
     single = load_single_levels(year, month)
     p850 = load_pressure_level(year, month, "850")
     p700 = load_pressure_level(year, month, "700")
@@ -327,6 +379,8 @@ def build_month_dataset(year: int, month: int) -> xr.Dataset:
 
 
 def audit_grid(ds: xr.Dataset, year: int, month: int) -> pd.DataFrame:
+    """Validate one month's latitude-longitude grid contract."""
+
     period = f"{year}-{month:02d}"
     rows = []
 
@@ -358,6 +412,8 @@ def audit_grid(ds: xr.Dataset, year: int, month: int) -> pd.DataFrame:
 
 
 def audit_time(ds: xr.Dataset, year: int, month: int) -> pd.DataFrame:
+    """Validate one month's complete, unique hourly UTC timeline."""
+
     period = f"{year}-{month:02d}"
     rows = []
 
@@ -385,6 +441,8 @@ def audit_time(ds: xr.Dataset, year: int, month: int) -> pd.DataFrame:
 
 
 def audit_variables(ds: xr.Dataset, year: int, month: int, quick: bool = False) -> tuple[pd.DataFrame, list[dict]]:
+    """Validate variable schema and, in full mode, variable-level statistics."""
+
     period = f"{year}-{month:02d}"
     rows = []
     summaries = []
@@ -480,6 +538,8 @@ def audit_variables(ds: xr.Dataset, year: int, month: int, quick: bool = False) 
 
 
 def audit_meteorology(ds: xr.Dataset, year: int, month: int) -> pd.DataFrame:
+    """Validate physical relationships and plausible meteorological ranges."""
+
     period = f"{year}-{month:02d}"
     rows = []
 
@@ -534,6 +594,8 @@ def audit_month(
     month: int,
     quick: bool = False,
 ):
+    """Combine all enabled audits for one standardized ERA5 month."""
+
     raw_audit = audit_raw_files(year, month)
     grid_audit = audit_grid(ds, year, month)
     time_audit = audit_time(ds, year, month)
@@ -576,6 +638,8 @@ def process_month(
     overwrite: bool = False,
     quick: bool = False,
 ):
+    """Build or re-audit one standardized ERA5 month."""
+
     period = f"{year}-{month:02d}"
 
     MONTHLY_NC_DIR.mkdir(
@@ -590,7 +654,14 @@ def process_month(
 
     start = time.perf_counter()
 
-    if nc_out.exists() and not overwrite:
+    expected_manifest = build_manifest(
+        dataset=f"era5_{period}",
+        source_paths=raw_files_for_month(year, month),
+        code_paths=preprocessing_code_paths(Path(__file__)),
+        configuration={"year": year, "month": month},
+    )
+
+    if not overwrite and outputs_are_current([nc_out], expected_manifest):
         ds = xr.open_dataset(nc_out)
 
         audit_df, var_summaries = audit_month(
@@ -600,10 +671,7 @@ def process_month(
             quick=quick,
         )
 
-        audit_pass = audit_df.loc[
-            audit_df["severity"].eq("error"),
-            "pass",
-        ].all()
+        audit_pass = audit_passes(audit_df)
 
         result = {
             "period": period,
@@ -642,19 +710,11 @@ def process_month(
         quick=quick,
     )
 
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
-
-    audit_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    audit_pass = audit_passes(audit_df)
 
     if audit_pass:
         ds.to_netcdf(nc_out)
+        write_manifests([nc_out], expected_manifest)
 
     result = {
         "period": period,
@@ -688,16 +748,9 @@ def print_report(
     monthly_summary: pd.DataFrame,
     audit_df: pd.DataFrame,
 ):
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
+    """Print a concise human-readable ERA5 audit report."""
 
-    audit_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    audit_pass = audit_passes(audit_df)
 
     failed = audit_df.loc[~audit_df["pass"]]
 
@@ -749,7 +802,17 @@ def process_era5(
     overwrite: bool = False,
     quick: bool = False,
 ) -> dict:
+    """Process and audit the configured range of monthly ERA5 files."""
+
     start = time.perf_counter()
+
+    audit_file = QUICK_AUDIT_FILE if quick else AUDIT_FILE
+    monthly_summary_file = (
+        QUICK_MONTHLY_SUMMARY_FILE if quick else MONTHLY_SUMMARY_FILE
+    )
+    feature_summary_file = (
+        QUICK_FEATURE_SUMMARY_FILE if quick else FEATURE_SUMMARY_FILE
+    )
 
     AUDIT_DIR.mkdir(
         parents=True,
@@ -779,11 +842,11 @@ def process_era5(
 
         try:
             result, audit_df, var_summaries = process_month(
-                year=year,
-                month=month,
-                overwrite=overwrite,
-                quick=quick,
-            )
+            year=year,
+            month=month,
+            overwrite=overwrite,
+            quick=quick,
+        )
 
             results.append(result)
 
@@ -820,10 +883,8 @@ def process_era5(
 
     monthly_summary = pd.DataFrame(results)
 
-    monthly_summary.to_csv(
-        MONTHLY_SUMMARY_FILE,
-        index=False,
-    )
+    audit_mode = "quick" if quick else "full"
+    monthly_summary["audit_mode"] = audit_mode
 
     audit_df = (
         pd.concat(audits, ignore_index=True)
@@ -831,18 +892,35 @@ def process_era5(
         else pd.DataFrame()
     )
 
-    audit_df.to_csv(
-        AUDIT_FILE,
-        index=False,
-    )
-
+    if not audit_df.empty:
+        audit_df["audit_mode"] = "quick" if quick else "full"
     feature_summary_df = pd.DataFrame(
         variable_summaries
     )
 
-    feature_summary_df.to_csv(
-        FEATURE_SUMMARY_FILE,
-        index=False,
+    all_raw_files = [
+        path
+        for year, month in months_range(START_YEAR, END_YEAR, END_MONTH)
+        for path in raw_files_for_month(year, month)
+    ]
+    audit_manifest = build_manifest(
+        dataset=f"era5_{audit_mode}_audit",
+        source_paths=all_raw_files,
+        code_paths=preprocessing_code_paths(Path(__file__)),
+        configuration={
+            "start_year": START_YEAR,
+            "end_year": END_YEAR,
+            "end_month": END_MONTH,
+            "audit_mode": audit_mode,
+        },
+    )
+    write_audit_artifacts(
+        {
+            monthly_summary_file: monthly_summary,
+            audit_file: audit_df,
+            feature_summary_file: feature_summary_df,
+        },
+        audit_manifest,
     )
 
     print_report(
@@ -850,16 +928,7 @@ def process_era5(
         audit_df=audit_df,
     )
 
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
-
-    overall_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    overall_pass = audit_passes(audit_df)
 
     complete_months = (
         int(monthly_summary["pass"].sum())
@@ -874,12 +943,12 @@ def process_era5(
         "months": len(monthly_summary),
         "complete_months": complete_months,
         "output_directory": str(MONTHLY_NC_DIR),
-        "audit_file": str(AUDIT_FILE),
+        "audit_file": str(audit_file),
         "monthly_summary_file": str(
-            MONTHLY_SUMMARY_FILE
+            monthly_summary_file
         ),
         "feature_summary_file": str(
-            FEATURE_SUMMARY_FILE
+            feature_summary_file
         ),
         "processing_seconds": round(
             time.perf_counter() - start,
@@ -888,7 +957,9 @@ def process_era5(
     }
 
 
-def main():
+def main() -> None:
+    """Run ERA5 preprocessing from the command line."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Preprocess raw ERA5 files into standardized "

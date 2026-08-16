@@ -1,179 +1,182 @@
-from pathlib import Path
+"""Audit or monitor the completeness of raw ERA5 downloads on disk."""
+
+from __future__ import annotations
+
 import argparse
-import os
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
+
 import pandas as pd
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-DEFAULT_PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
-
-START_YEAR = 2015
-END_YEAR = 2026
-END_MONTH = 6
-
-EXPECTED_SINGLE_NC_COUNT = 3
+from config import (
+    ERA5_PRESSURE_LEVEL_DIR,
+    ERA5_RAW_DIR,
+    ERA5_SINGLE_LEVEL_DIR,
+    PIPELINE_END_MONTH,
+    PIPELINE_END_YEAR,
+    PIPELINE_START_YEAR,
+    PROJECT_ROOT,
+)
+from era5.era5_downloader import (
+    PRESSURE_REQUESTS,
+    SINGLE_LEVEL_FILENAMES,
+    pressure_output_path,
+    valid_nc,
+    valid_single_folder,
+)
 
 
 def clear_terminal() -> None:
-    os.system("cls" if os.name == "nt" else "clear")
+    """Clear an interactive terminal without launching a shell command."""
+
+    print("\033[2J\033[H", end="")
 
 
 def audit_era5_downloads(
-    project_root: Path = DEFAULT_PROJECT_ROOT,
-    start_year: int = START_YEAR,
-    end_year: int = END_YEAR,
-    end_month: int = END_MONTH,
-    expected_single_nc_count: int = EXPECTED_SINGLE_NC_COUNT,
+    project_root: Path = PROJECT_ROOT,
+    start_year: int = PIPELINE_START_YEAR,
+    end_year: int = PIPELINE_END_YEAR,
+    end_month: int = PIPELINE_END_MONTH,
 ) -> pd.DataFrame:
-    era5_dir = project_root / "data" / "raw" / "weather" / "era5"
-    single_dir = era5_dir / "single_levels"
-    pressure_dir = era5_dir / "pressure_levels"
+    """Return monthly file-presence and content-validation results."""
 
-    records = []
+    if project_root == PROJECT_ROOT:
+        single_dir = ERA5_SINGLE_LEVEL_DIR
+        pressure_dir = ERA5_PRESSURE_LEVEL_DIR
+    else:
+        era5_dir = project_root / "data" / "raw" / "weather" / "era5"
+        single_dir = era5_dir / "single_levels"
+        pressure_dir = era5_dir / "pressure_levels"
 
+    records: list[dict[str, object]] = []
     for year in range(start_year, end_year + 1):
         last_month = end_month if year == end_year else 12
-
         for month in range(1, last_month + 1):
-            year_s = str(year)
-            month_s = f"{month:02d}"
-            period = f"{year_s}-{month_s}"
+            period = f"{year}-{month:02d}"
+            folder = single_dir / f"era5_single_levels_alberta_{year}_{month:02d}"
+            single_paths = [folder / name for name in SINGLE_LEVEL_FILENAMES]
+            single_present = sum(path.exists() for path in single_paths)
+            single_complete = valid_single_folder(folder, year, month)
 
-            single_folder = single_dir / f"era5_single_levels_alberta_{year_s}_{month_s}"
-            single_nc_files = sorted(single_folder.glob("*.nc")) if single_folder.exists() else []
-
-            single_nc_count = len(single_nc_files)
-            single_complete = single_nc_count == expected_single_nc_count
-
-            p850 = pressure_dir / f"era5_pressure_850_temp_wind_rh_alberta_{year_s}_{month_s}.nc"
-            p700 = pressure_dir / f"era5_pressure_700_temp_wind_rh_alberta_{year_s}_{month_s}.nc"
-            p500 = pressure_dir / f"era5_pressure_500_geopotential_wind_alberta_{year_s}_{month_s}.nc"
-
-            p850_exists = p850.exists()
-            p700_exists = p700.exists()
-            p500_exists = p500.exists()
-
-            pressure_downloaded = sum([p850_exists, p700_exists, p500_exists])
-            pressure_complete = pressure_downloaded == 3
-
-            total_files_downloaded = single_nc_count + pressure_downloaded
-            total_files_needed = expected_single_nc_count + 3
+            pressure_paths = [
+                pressure_dir / pressure_output_path(year, month, request).name
+                for request in PRESSURE_REQUESTS
+            ]
+            pressure_present = sum(path.exists() for path in pressure_paths)
+            pressure_valid = [
+                valid_nc(path, year, month)
+                for path in pressure_paths
+            ]
+            pressure_complete = all(pressure_valid)
 
             records.append(
                 {
                     "period": period,
                     "year": year,
                     "month": month,
-                    "single_folder_exists": single_folder.exists(),
-                    "single_nc_count": single_nc_count,
-                    "single_nc_expected": expected_single_nc_count,
-                    "single_progress": f"{single_nc_count}/{expected_single_nc_count}",
+                    "single_files_present": single_present,
+                    "single_files_expected": len(SINGLE_LEVEL_FILENAMES),
                     "single_complete": single_complete,
-                    "single_nc_files": "; ".join([f.name for f in single_nc_files]),
-                    "pressure_downloaded": pressure_downloaded,
-                    "pressure_total_needed": 3,
-                    "pressure_progress": f"{pressure_downloaded}/3",
+                    "pressure_files_present": pressure_present,
+                    "pressure_files_expected": len(PRESSURE_REQUESTS),
+                    "pressure_files_valid": sum(pressure_valid),
                     "pressure_complete": pressure_complete,
-                    "p850_exists": p850_exists,
-                    "p700_exists": p700_exists,
-                    "p500_exists": p500_exists,
-                    "total_files_downloaded": total_files_downloaded,
-                    "total_files_needed": total_files_needed,
-                    "total_progress": f"{total_files_downloaded}/{total_files_needed}",
                     "month_complete": single_complete and pressure_complete,
                 }
             )
-
     return pd.DataFrame(records)
 
 
 def save_audit_csv(audit: pd.DataFrame, project_root: Path) -> Path:
+    """Save the raw-download audit beside the ERA5 source archive."""
+
     output_path = (
-        project_root
-        / "data"
-        / "raw"
-        / "weather"
-        / "era5"
-        / "era5_download_audit.csv"
-    )
+        ERA5_RAW_DIR
+        if project_root == PROJECT_ROOT
+        else project_root / "data" / "raw" / "weather" / "era5"
+    ) / "era5_download_audit.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     audit.to_csv(output_path, index=False)
     return output_path
 
 
 def print_summary(download_audit: pd.DataFrame) -> None:
-    single_done = download_audit["single_nc_count"].sum()
-    single_needed = download_audit["single_nc_expected"].sum()
+    """Print a concise summary of valid ERA5 months and files."""
 
-    pressure_done = download_audit["pressure_downloaded"].sum()
-    pressure_needed = download_audit["pressure_total_needed"].sum()
-
-    total_done = download_audit["total_files_downloaded"].sum()
-    total_needed = download_audit["total_files_needed"].sum()
-
-    complete_months = download_audit["month_complete"].sum()
+    complete_months = int(download_audit["month_complete"].sum())
     total_months = len(download_audit)
+    valid_pressure = int(download_audit["pressure_files_valid"].sum())
+    expected_pressure = int(download_audit["pressure_files_expected"].sum())
+    valid_single_months = int(download_audit["single_complete"].sum())
 
     print("=" * 80)
-    print("ERA5 RAW DOWNLOAD DISK AUDIT")
+    print("ERA5 RAW DOWNLOAD VALIDATION")
     print("=" * 80)
-    print(f"Last refreshed:                {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Single-level .nc files present: {single_done}/{single_needed}")
-    print(f"Pressure-level files present:   {pressure_done}/{pressure_needed}")
-    print(f"Total usable raw files present: {total_done}/{total_needed}")
-    print(f"Complete months:                {complete_months}/{total_months}")
+    print(f"Last refreshed:               {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f"Valid single-level months:    {valid_single_months}/{total_months}")
+    print(f"Valid pressure-level files:   {valid_pressure}/{expected_pressure}")
+    print(f"Complete validated months:    {complete_months}/{total_months}")
 
 
-def run_once(args: argparse.Namespace) -> None:
+def run_once(args: argparse.Namespace) -> bool:
+    """Run one validation pass and return whether every month is complete."""
+
     audit = audit_era5_downloads(
         project_root=args.project_root,
         start_year=args.start_year,
         end_year=args.end_year,
         end_month=args.end_month,
-        expected_single_nc_count=args.expected_single_nc_count,
     )
-
     print_summary(audit)
-
     if args.save_csv:
         output_path = save_audit_csv(audit, args.project_root)
         print(f"\nSaved audit CSV to: {output_path}")
+    return bool(audit["month_complete"].all()) if not audit.empty else False
 
 
 def run_watch(args: argparse.Namespace) -> None:
+    """Repeat validation until interrupted by the user."""
+
     try:
         while True:
             clear_terminal()
             run_once(args)
-            print(f"\nWatching for changes. Refreshing every {args.refresh_seconds} seconds.")
-            print("Press Ctrl+C to stop.")
+            print(f"\nRefreshing every {args.refresh_seconds} seconds. Ctrl+C stops.")
             time.sleep(args.refresh_seconds)
-
     except KeyboardInterrupt:
         print("\nStopped live ERA5 download monitor.")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Audit ERA5 usable raw NetCDF files on disk."
-    )
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build command-line arguments for one-shot and watch modes."""
 
-    parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
-    parser.add_argument("--start-year", type=int, default=START_YEAR)
-    parser.add_argument("--end-year", type=int, default=END_YEAR)
-    parser.add_argument("--end-month", type=int, default=END_MONTH)
-    parser.add_argument("--expected-single-nc-count", type=int, default=EXPECTED_SINGLE_NC_COUNT)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
+    parser.add_argument("--start-year", type=int, default=PIPELINE_START_YEAR)
+    parser.add_argument("--end-year", type=int, default=PIPELINE_END_YEAR)
+    parser.add_argument("--end-month", type=int, default=PIPELINE_END_MONTH)
     parser.add_argument("--save-csv", action="store_true")
-    parser.add_argument("--watch", action="store_true", help="Refresh the audit repeatedly.")
+    parser.add_argument("--watch", action="store_true")
     parser.add_argument("--refresh-seconds", type=int, default=10)
+    return parser
 
+
+def main() -> None:
+    """Run the ERA5 disk validator and signal incomplete one-shot audits."""
+
+    parser = build_argument_parser()
     args = parser.parse_args()
-
+    if args.refresh_seconds <= 0:
+        parser.error("--refresh-seconds must be positive")
     if args.watch:
         run_watch(args)
-    else:
-        run_once(args)
+    elif not run_once(args):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -24,23 +24,43 @@ PIPELINE OVERVIEW:
 
 from pathlib import Path
 import argparse
-import pandas as pd
+from functools import partial
+import sys
 import time
 
+import pandas as pd
 
-# Path objects represent filesystem locations, and the / operator appends
-# folders or filenames without manually constructing platform-specific strings.
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from config import (
+    GENERATION_CSV,
+    GENERATION_PARQUET,
+    PROJECT_ROOT,
+    PREPROCESSING_AUDITS_DIR,
+)
+from preprocessing.shared import (
+    DuplicateConflictError,
+    add_check,
+    add_duplicate_checks,
+    audit_passes,
+    build_manifest,
+    deduplicate_or_raise,
+    duplicate_failure_audit,
+    outputs_are_current,
+    preprocessing_code_paths,
+    set_duplicate_stats,
+    write_audit_artifacts,
+    write_tabular_outputs,
+)
+
 RAW_GENERATION_FILE = PROJECT_ROOT / "data" / "raw" / "Gen Table_Full Data_data.csv"
-PREPROCESSING_DIR = PROJECT_ROOT / "data" / "preprocessing"
-AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
-OUTPUT_CSV = PREPROCESSING_DIR / "generation_by_fuel.csv"
-OUTPUT_PARQUET = PREPROCESSING_DIR / "generation_by_fuel.parquet"
+OUTPUT_CSV = GENERATION_CSV
+OUTPUT_PARQUET = GENERATION_PARQUET
+AUDIT_DIR = PREPROCESSING_AUDITS_DIR
 AUDIT_FILE = AUDIT_DIR / "generation_audit_checks.csv"
 SUMMARY_FILE = AUDIT_DIR / "generation_feature_summary.csv"
 
-# This dictionary translates the fuel labels used in the raw AESO file into
-# consistent snake_case names suitable for cleaned DataFrame columns.
 FUEL_MAP = {
     "Coal": "coal",
     "Cogeneration": "cogeneration",
@@ -55,8 +75,6 @@ FUEL_MAP = {
     "Wind": "wind",
 }
 
-# This mapping standardizes the raw generation metric labels so each metric
-# can be incorporated into predictable fuel-and-metric feature names.
 METRIC_MAP = {
     "System Generation": "system_generation",
     "Total Generation": "total_generation",
@@ -65,33 +83,22 @@ METRIC_MAP = {
     "Maximum Capacity": "maximum_capacity",
 }
 
-# Extract the standardized mapping values into reusable ordered lists.
-# These lists are later used to generate every expected feature column.
 FUELS = list(FUEL_MAP.values())
 METRICS = list(METRIC_MAP.values())
 
-# The nested comprehension creates every possible fuel-and-metric feature.
-# The metric loop is outermost, so columns are grouped by metric and then fuel.
 FEATURE_COLUMNS = [
     f"{fuel}_{metric}"
     for metric in METRICS
     for fuel in FUELS
 ]
 
-# Build one aggregate column name for each generation metric, such as
-# total_system_generation and total_system_capacity.
 TOTAL_COLUMNS = [
     f"total_{metric}"
     for metric in METRICS
 ]
 
-# The starred expressions unpack all generated feature and total names into
-# one set alongside the timestamp column. A set makes schema comparisons easy.
 EXPECTED_COLUMNS = {"timestamp_utc", *FEATURE_COLUMNS, *TOTAL_COLUMNS}
 
-# Each dictionary comprehension assigns the same reasonable range to every
-# fuel column belonging to one metric. The ** operators merge those generated
-# dictionaries with the separate, wider ranges used for system-wide totals.
 RANGE_EXPECTATIONS = {
     **{f"{fuel}_system_generation": (0, 10000) for fuel in FUELS},
     **{f"{fuel}_total_generation": (0, 10000) for fuel in FUELS},
@@ -117,9 +124,6 @@ def load_raw_generation(raw_file: Path = RAW_GENERATION_FILE) -> pd.DataFrame:
         clean, readable raw DataFrame to clean_generation(), which depends
         on stripped/normalized headers to find the columns it needs.
     """
-    # raw_file is expected to be a Path and defaults to the configured AESO
-    # source file. The return annotation documents that the function produces
-    # a pandas DataFrame containing the raw generation records.
     if not raw_file.exists():
         raise FileNotFoundError(f"Missing raw generation file: {raw_file}")
 
@@ -146,16 +150,12 @@ def clean_generation(raw: pd.DataFrame) -> pd.DataFrame:
         audit_generation() expects to validate and that downstream models
         will eventually consume.
     """
-    # This set defines the minimum raw schema required for the transformation.
-    # Unpacking METRIC_MAP.keys() includes every expected AESO metric column.
     required_raw_columns = {
         "Date - MST",
         "Fuel Type",
         *METRIC_MAP.keys(),
     }
 
-    # Set subtraction returns the required names that are absent from the
-    # actual DataFrame columns, providing a direct missing-schema check.
     missing = required_raw_columns - set(raw.columns)
     if missing:
         raise ValueError(f"Missing raw generation columns: {missing}")
@@ -185,9 +185,6 @@ def clean_generation(raw: pd.DataFrame) -> pd.DataFrame:
     for col in METRIC_MAP:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # melt converts the separate metric columns into rows, producing one
-    # measurement per timestamp, fuel type, and metric. This normalized long
-    # form makes it easy to build standardized feature names before pivoting.
     long = df.melt(
         id_vars=["timestamp_utc", "fuel_type"],
         value_vars=list(METRIC_MAP.keys()),
@@ -199,16 +196,20 @@ def clean_generation(raw: pd.DataFrame) -> pd.DataFrame:
     long["metric_clean"] = long["metric"].map(METRIC_MAP)
     long["feature"] = long["fuel_clean"] + "_" + long["metric_clean"]
 
-    # pivot_table converts the normalized rows into one row per timestamp.
-    # Each generated feature name becomes a column, and repeated observations
-    # for the same timestamp and feature are combined using sum.
+    long, exact_duplicate_rows = deduplicate_or_raise(
+        long,
+        ["timestamp_utc", "feature"],
+        ignore_columns=["fuel_type", "metric", "fuel_clean", "metric_clean"],
+        dataset_name="generation",
+    )
+
     wide = (
         long
         .pivot_table(
             index="timestamp_utc",
             columns="feature",
             values="value",
-            aggfunc="sum",
+            aggfunc="first",
         )
         .sort_index()
     )
@@ -230,12 +231,14 @@ def clean_generation(raw: pd.DataFrame) -> pd.DataFrame:
     out = (
         out[final_columns]
         .dropna(subset=["timestamp_utc"])
-        .drop_duplicates(subset=["timestamp_utc"], keep="last")
         .sort_values("timestamp_utc")
         .reset_index(drop=True)
     )
 
-    return out
+    return set_duplicate_stats(
+        out,
+        exact_duplicate_rows=exact_duplicate_rows,
+    )
 
 
 def audit_generation(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
@@ -249,32 +252,9 @@ def audit_generation(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, bool
         boolean pass/fail result determines whether process_generation()
         is allowed to write the cleaned data out as an approved product.
     """
-    # The return annotation documents that this function produces three
-    # results in order: the audit table, the feature summary, and a pass flag.
     rows = []
-
-    def add(check, passed, observed=None, expected=None, severity="error", notes=""):
-        """
-        General purpose:
-            Append one standardized audit result (as a dict) to the shared
-            `rows` list, so every check is recorded in the same shape.
-
-        Role in the pipeline:
-            This is a local helper used only within audit_generation(). It
-            keeps every individual check consistent so they can all be
-            converted into a single audit_df table at the end.
-        """
-        # These optional parameters provide defaults for ordinary error-level
-        # checks while allowing callers to attach expectations, notes, or a
-        # different severity when a check is informational or non-fatal.
-        rows.append({
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        })
+    add = partial(add_check, rows)
+    add_duplicate_checks(rows, df)
 
     add("timestamp_column_exists", "timestamp_utc" in df.columns, "timestamp_utc" in df.columns, True)
 
@@ -451,7 +431,7 @@ def audit_generation(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, bool
     summary["dtype"] = [str(df[c].dtype) for c in feature_cols]
 
     audit_df = pd.DataFrame(rows)
-    audit_pass = audit_df.loc[audit_df["severity"].eq("error"), "pass"].all()
+    audit_pass = audit_passes(audit_df)
 
     return audit_df, summary, bool(audit_pass)
 
@@ -471,9 +451,7 @@ def print_audit_report(
         pass/fail decision — it only surfaces what audit_generation() found
         so a person can quickly review the health of the cleaned dataset.
     """
-    # The -> None annotation documents that this function does not return a
-    # value. Its work consists entirely of printing the audit to the terminal.
-    audit_pass = audit_df.loc[audit_df["severity"] == "error", "pass"].all()
+    audit_pass = audit_passes(audit_df)
     failed = audit_df.loc[~audit_df["pass"]]
 
     ts = pd.DatetimeIndex(pd.to_datetime(clean["timestamp_utc"], utc=True))
@@ -534,12 +512,18 @@ def process_generation(overwrite: bool = False) -> dict:
         whether to skip work (if outputs already exist), and only writes
         the final cleaned files if the audit's error-level checks pass.
     """
-    # overwrite defaults to False so existing outputs are normally preserved.
-    # The function always returns a dictionary describing whether processing
-    # was skipped, failed its audit, completed successfully, or raised an error.
     start_time = time.perf_counter()
 
-    if OUTPUT_CSV.exists() and OUTPUT_PARQUET.exists() and not overwrite:
+    expected_manifest = build_manifest(
+        dataset="generation_by_fuel",
+        source_paths=[RAW_GENERATION_FILE],
+        code_paths=preprocessing_code_paths(Path(__file__)),
+    )
+
+    if not overwrite and outputs_are_current(
+        [OUTPUT_CSV, OUTPUT_PARQUET, AUDIT_FILE, SUMMARY_FILE],
+        expected_manifest,
+    ):
         return {
             "dataset": "generation_by_fuel",
             "status": "skipped_existing",
@@ -554,9 +538,9 @@ def process_generation(overwrite: bool = False) -> dict:
         audit_df, summary_df, audit_pass = audit_generation(clean)
         print_audit_report(audit_df, summary_df, clean)
 
-        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-        audit_df.to_csv(AUDIT_FILE, index=False)
-        summary_df.to_csv(SUMMARY_FILE, index=False)
+        write_audit_artifacts(
+            {AUDIT_FILE: audit_df, SUMMARY_FILE: summary_df}
+        )
 
         if not audit_pass:
             return {
@@ -568,10 +552,13 @@ def process_generation(overwrite: bool = False) -> dict:
                 "processing_seconds": round(time.perf_counter() - start_time, 3),
             }
 
-        PREPROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-
-        clean.to_csv(OUTPUT_CSV, index=False)
-        clean.to_parquet(OUTPUT_PARQUET, index=False)
+        write_tabular_outputs(
+            clean,
+            parquet_path=OUTPUT_PARQUET,
+            csv_path=OUTPUT_CSV,
+            manifest=expected_manifest,
+            provenance_artifacts=[AUDIT_FILE, SUMMARY_FILE],
+        )
 
         return {
             "dataset": "generation_by_fuel",
@@ -587,6 +574,17 @@ def process_generation(overwrite: bool = False) -> dict:
             "parquet_file": str(OUTPUT_PARQUET),
             "audit_file": str(AUDIT_FILE),
             "summary_file": str(SUMMARY_FILE),
+            "processing_seconds": round(time.perf_counter() - start_time, 3),
+        }
+
+    except DuplicateConflictError as exc:
+        write_audit_artifacts({AUDIT_FILE: duplicate_failure_audit(exc)})
+        return {
+            "dataset": "generation_by_fuel",
+            "status": "audit_failed",
+            "pass": False,
+            "error": str(exc),
+            "audit_file": str(AUDIT_FILE),
             "processing_seconds": round(time.perf_counter() - start_time, 3),
         }
 
@@ -627,8 +625,5 @@ def main() -> None:
     print("=" * 80)
 
 
-# Python assigns __name__ the value "__main__" when this file is executed
-# directly. When the file is imported, __name__ contains the module name,
-# which prevents main() from running automatically during the import.
 if __name__ == "__main__":
     main()

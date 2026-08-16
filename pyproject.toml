@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alberta-power-markets"
+version = "0.1.0"
+description = "Audited hourly data pipeline for Alberta electricity-market analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cdsapi>=0.7.7",
+    "holidays>=0.100",
+    "netCDF4>=1.7.4",
+    "numpy>=2.5.0",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.3",
+    "pyarrow>=24.0.0",
+    "xarray>=2026.4.0",
+]
+
+[project.scripts]
+alberta-power-pipeline = "run_pipeline:main"
+era5-download = "era5.era5_downloader:main"
+era5-progress = "era5.era5_download_progress:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["config", "pipeline_shared", "run_pipeline"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

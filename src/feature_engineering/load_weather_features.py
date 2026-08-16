@@ -31,9 +31,17 @@ For weather variable x:
 The load shares therefore change every hour and reflect the actual spatial
 distribution of Alberta load rather than provisional static estimates.
 
+Information timing
+------------------
+These are ex-post explanatory features: actual same-hour regional load is
+used both as an output and as the weather weight. They must not be used as
+predictors of that same hour's load. Temperature changes and rolling fields
+also include the current observed hour; their names intentionally omit
+``prior``.
+
 Input
 -----
-data/preprocessing/area_load_preprocessed.parquet
+data/processed/preprocessing/area_load_preprocessed.parquet
 
 Required regional load columns:
     calgary_load_mw
@@ -47,17 +55,20 @@ Required regional load columns:
 
 Output
 ------
-data/features/weather/load_weather_features_hourly.parquet
-data/features/weather/load_weather_features_hourly.csv          optional
-data/features/weather/load_region_weather_mapping.csv
-data/audits/load_weather_features_monthly_summary.csv
-data/audits/load_weather_features_audit_checks.csv
+data/processed/feature_engineering/weather/load_weather_features_hourly.parquet
+data/processed/feature_engineering/weather/load_weather_features_hourly.csv
+data/audits/feature_engineering/load_region_weather_mapping.csv
+data/audits/feature_engineering/load_weather_features_monthly_summary.csv
+data/audits/feature_engineering/load_weather_features_audit_checks.csv
 """
+
+# ============================================================================
+# Imports
+# ============================================================================
 
 from __future__ import annotations
 
 import argparse
-import calendar
 import logging
 import time
 from pathlib import Path
@@ -67,6 +78,61 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+try:
+    from .shared import (
+        add_period_check as add_check,
+        apply_feature_builders as run_feature_builders,
+        audit_passed,
+        build_manifest,
+        configure_logging,
+        ensure_directories,
+        feature_code_paths,
+        ensure_src_on_path,
+        existing_outputs_satisfy_request as outputs_satisfy_request,
+        expected_month_hours,
+        get_monthly_files,
+        haversine_distance_km,
+        load_grid,
+        monthly_file_period,
+        nearest_coordinate,
+        output_is_current,
+        read_existing_parquet,
+        save_feature_outputs as write_feature_outputs,
+        save_tables,
+        weather_array,
+        weighted_average as hourly_weighted_average,
+        weighted_standard_deviation as hourly_weighted_standard_deviation,
+        write_manifest,
+    )
+except ImportError:  # Support direct execution of this file.
+    from shared import (
+        add_period_check as add_check,
+        apply_feature_builders as run_feature_builders,
+        audit_passed,
+        build_manifest,
+        configure_logging,
+        ensure_directories,
+        feature_code_paths,
+        ensure_src_on_path,
+        existing_outputs_satisfy_request as outputs_satisfy_request,
+        expected_month_hours,
+        get_monthly_files,
+        haversine_distance_km,
+        load_grid,
+        monthly_file_period,
+        nearest_coordinate,
+        output_is_current,
+        read_existing_parquet,
+        save_feature_outputs as write_feature_outputs,
+        save_tables,
+        weather_array,
+        weighted_average as hourly_weighted_average,
+        weighted_standard_deviation as hourly_weighted_standard_deviation,
+        write_manifest,
+    )
+
+ensure_src_on_path(__file__)
+
 
 # ============================================================================
 # Logging
@@ -75,45 +141,17 @@ import xarray as xr
 LOGGER = logging.getLogger(__name__)
 
 
-def configure_logging(
-    verbose: bool = False,
-) -> None:
-    """
-    Configure console logging for the pipeline.
-
-    INFO is used by default. DEBUG can be enabled with --verbose.
-    """
-
-    logging.basicConfig(
-        level=(
-            logging.DEBUG
-            if verbose
-            else logging.INFO
-        ),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-
-
 # ============================================================================
 # Project paths
 # ============================================================================
 
-# This file is expected to live at:
-#
-#     PROJECT_ROOT/src/feature_engineering/load_weather_features.py
-#
-# parents[0] -> feature_engineering
-# parents[1] -> src
-# parents[2] -> project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-PREPROCESSING_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "preprocessing"
+from config import (
+    PREPROCESSING_DIR,
+    FEATURES_DIR,
+    FEATURE_ENGINEERING_AUDITS_DIR,
+    PROJECT_ROOT,
 )
+
 
 ERA5_MONTHLY_DIR = (
     PREPROCESSING_DIR
@@ -122,56 +160,54 @@ ERA5_MONTHLY_DIR = (
     / "monthly_standardized"
 )
 
+
 AREA_LOAD_FILE = (
     PREPROCESSING_DIR
     / "area_load_preprocessed.parquet"
 )
+
 
 LOAD_REGIONS_FILE = (
     PREPROCESSING_DIR
     / "load_regions.csv"
 )
 
-FEATURES_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "features"
-)
 
 OUTPUT_DIR = (
     FEATURES_DIR
     / "weather"
 )
 
+
 OUTPUT_PARQUET = (
     OUTPUT_DIR
     / "load_weather_features_hourly.parquet"
 )
+
 
 OUTPUT_CSV = (
     OUTPUT_DIR
     / "load_weather_features_hourly.csv"
 )
 
-# Backward-compatible alias retained for any external imports that still
-# reference OUTPUT_FILE.
+
 OUTPUT_FILE = OUTPUT_PARQUET
+
 
 LOAD_REGION_MAPPING_FILE = (
     OUTPUT_DIR
     / "load_region_weather_mapping.csv"
 )
 
-AUDIT_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "audits"
-)
+
+AUDIT_DIR = FEATURE_ENGINEERING_AUDITS_DIR
+
 
 MONTHLY_SUMMARY_FILE = (
     AUDIT_DIR
     / "load_weather_features_monthly_summary.csv"
 )
+
 
 AUDIT_FILE = (
     AUDIT_DIR
@@ -184,6 +220,7 @@ AUDIT_FILE = (
 # ============================================================================
 
 DATASET_NAME = "load_weather_features"
+FEATURE_INFORMATION_POLICY = "ex_post_actual_load_weighted"
 TIMEZONE = "America/Edmonton"
 
 REGION_LOAD_COLUMNS = {
@@ -196,7 +233,7 @@ REGION_LOAD_COLUMNS = {
 }
 
 # Representative weather points for the six AESO regions.
-# A user-maintained data/preprocessing/load_regions.csv overrides these values.
+# A user-maintained file in data/processed/preprocessing overrides these values.
 DEFAULT_LOAD_REGIONS = pd.DataFrame(
     [
         {
@@ -254,77 +291,13 @@ SOURCE_VARIABLES = [
 
 
 # ============================================================================
-# General helpers
-# ============================================================================
-
-def ensure_output_directories() -> None:
-    """Create feature and audit output directories if they do not exist."""
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    AUDIT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-def add_check(
-    rows: list[dict],
-    period: str,
-    check: str,
-    passed: bool,
-    observed=None,
-    expected=None,
-    severity: str = "error",
-    notes: str = "",
-) -> None:
-    rows.append(
-        {
-            "period": period,
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        }
-    )
-
-
-def monthly_file_period(
-    path: Path,
-) -> str:
-    parts = path.stem.split("_")
-    return f"{parts[-2]}-{parts[-1]}"
-
-
-def expected_month_hours(
-    period: str,
-) -> int:
-    year, month = map(
-        int,
-        period.split("-"),
-    )
-
-    return (
-        calendar.monthrange(
-            year,
-            month,
-        )[1]
-        * 24
-    )
-
-
-# ============================================================================
 # AESO hourly regional load
 # ============================================================================
 
 def load_hourly_area_load(
     path: Path = AREA_LOAD_FILE,
 ) -> pd.DataFrame:
+    """Load and validate the regional hourly load backbone."""
     if not path.exists():
         raise FileNotFoundError(
             f"Missing preprocessed AESO area-load file: {path}"
@@ -422,6 +395,7 @@ def load_hourly_area_load(
 def add_region_load_shares(
     load: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Convert regional load values to same-hour spatial weights."""
     load = load.copy()
 
     share_columns = []
@@ -481,6 +455,7 @@ def add_region_load_shares(
 def load_load_regions(
     path: Path = LOAD_REGIONS_FILE,
 ) -> pd.DataFrame:
+    """Load user-supplied region locations or validated defaults."""
     regions = (
         pd.read_csv(path)
         if path.exists()
@@ -631,131 +606,12 @@ def load_load_regions(
 # ERA5 spatial mapping
 # ============================================================================
 
-def get_monthly_files(
-    monthly_dir: Path,
-) -> list[Path]:
-    files = sorted(
-        monthly_dir.glob(
-            "era5_alberta_standardized_*.nc"
-        )
-    )
-
-    if not files:
-        raise FileNotFoundError(
-            f"No monthly ERA5 files found in {monthly_dir}"
-        )
-
-    return files
-
-
-def load_grid(
-    reference_file: Path,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-]:
-    with xr.open_dataset(
-        reference_file
-    ) as ds:
-        required = {
-            "lat",
-            "lon",
-            "timestamp",
-        }
-
-        available = (
-            set(ds.coords)
-            | set(ds.dims)
-        )
-
-        missing = sorted(
-            required
-            - available
-        )
-
-        if missing:
-            raise ValueError(
-                f"{reference_file.name} is missing coordinates: {missing}"
-            )
-
-        latitudes = np.asarray(
-            ds["lat"].values,
-            dtype=float,
-        )
-
-        longitudes = np.asarray(
-            ds["lon"].values,
-            dtype=float,
-        )
-
-    return (
-        latitudes,
-        longitudes,
-    )
-
-
-def nearest_coordinate(
-    value: float,
-    coordinates: np.ndarray,
-) -> tuple[
-    float,
-    int,
-]:
-    position = int(
-        np.abs(
-            coordinates - value
-        ).argmin()
-    )
-
-    return (
-        float(
-            coordinates[position]
-        ),
-        position,
-    )
-
-
-def haversine_distance_km(
-    lat1: float,
-    lon1: float,
-    lat2: float,
-    lon2: float,
-) -> float:
-    radius = 6371.0088
-
-    p1 = np.radians(lat1)
-    p2 = np.radians(lat2)
-
-    delta_latitude = p2 - p1
-    delta_longitude = np.radians(
-        lon2 - lon1
-    )
-
-    a = (
-        np.sin(
-            delta_latitude / 2
-        ) ** 2
-        + np.cos(p1)
-        * np.cos(p2)
-        * np.sin(
-            delta_longitude / 2
-        ) ** 2
-    )
-
-    return float(
-        radius
-        * 2
-        * np.arcsin(
-            np.sqrt(a)
-        )
-    )
-
-
 def map_load_regions_to_grid(
     regions: pd.DataFrame,
     latitudes: np.ndarray,
     longitudes: np.ndarray,
 ) -> pd.DataFrame:
+    """Map each representative region to its nearest ERA5 grid cell."""
     mapped = regions.copy()
 
     mapping_rows = []
@@ -858,6 +714,7 @@ def extract_load_region_sites(
     ds: xr.Dataset,
     mapping: pd.DataFrame,
 ) -> xr.Dataset:
+    """Extract every required variable at the mapped regional sites."""
     unique_sites = (
         mapping[
             [
@@ -908,20 +765,17 @@ def extract_load_region_sites(
         },
     )
 
-    variables = [
-        variable
-        for variable in SOURCE_VARIABLES
-        if variable in ds.data_vars
-    ]
-
-    if not variables:
+    missing_variables = sorted(
+        set(SOURCE_VARIABLES) - set(ds.data_vars)
+    )
+    if missing_variables:
         raise ValueError(
-            "Monthly ERA5 file contains none of the configured "
-            "load-weather variables."
+            "Monthly ERA5 file is missing required load-weather variables: "
+            f"{missing_variables}"
         )
 
     return ds[
-        variables
+        SOURCE_VARIABLES
     ].sel(
         lat=latitude_indexer,
         lon=longitude_indexer,
@@ -929,30 +783,11 @@ def extract_load_region_sites(
     )
 
 
-def weather_array(
-    site_dataset: xr.Dataset,
-    variable: str,
-) -> np.ndarray | None:
-    if variable not in site_dataset.data_vars:
-        return None
-
-    return np.asarray(
-        site_dataset[
-            variable
-        ]
-        .transpose(
-            "timestamp",
-            "weather_site_id",
-        )
-        .values,
-        dtype=float,
-    )
-
-
 def region_values_from_sites(
     site_values: np.ndarray,
     mapping: pd.DataFrame,
 ) -> np.ndarray:
+    """Expand site values into the configured regional order."""
     site_positions = (
         mapping[
             "weather_site_id"
@@ -1189,108 +1024,6 @@ def wind_chill_temperature_c(
 # ============================================================================
 # Hourly weighting
 # ============================================================================
-
-def hourly_weighted_average(
-    values: np.ndarray,
-    weights: np.ndarray,
-) -> np.ndarray:
-    if values.shape != weights.shape:
-        raise ValueError(
-            "Weather values and hourly weights must have the same shape. "
-            f"Observed values={values.shape}, weights={weights.shape}"
-        )
-
-    valid = (
-        np.isfinite(values)
-        & np.isfinite(weights)
-    )
-
-    valid_weights = np.where(
-        valid,
-        weights,
-        0.0,
-    )
-
-    numerator = np.nansum(
-        values
-        * valid_weights,
-        axis=1,
-    )
-
-    denominator = np.sum(
-        valid_weights,
-        axis=1,
-    )
-
-    result = np.full(
-        values.shape[0],
-        np.nan,
-        dtype=float,
-    )
-
-    np.divide(
-        numerator,
-        denominator,
-        out=result,
-        where=denominator > 0,
-    )
-
-    return result
-
-
-def hourly_weighted_standard_deviation(
-    values: np.ndarray,
-    weights: np.ndarray,
-) -> np.ndarray:
-    weighted_mean = hourly_weighted_average(
-        values,
-        weights,
-    )
-
-    valid = (
-        np.isfinite(values)
-        & np.isfinite(weights)
-    )
-
-    valid_weights = np.where(
-        valid,
-        weights,
-        0.0,
-    )
-
-    squared_deviation = (
-        values
-        - weighted_mean[:, None]
-    ) ** 2
-
-    numerator = np.nansum(
-        squared_deviation
-        * valid_weights,
-        axis=1,
-    )
-
-    denominator = np.sum(
-        valid_weights,
-        axis=1,
-    )
-
-    result = np.full(
-        values.shape[0],
-        np.nan,
-        dtype=float,
-    )
-
-    np.divide(
-        numerator,
-        denominator,
-        out=result,
-        where=denominator > 0,
-    )
-
-    return np.sqrt(
-        result
-    )
-
 
 def build_monthly_base_weather(
     timestamps: pd.DatetimeIndex,
@@ -1548,8 +1281,13 @@ def build_monthly_base_weather(
 def add_temperature_unit_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add Celsius representations of Kelvin temperature fields."""
+
     frame = frame.copy()
 
+    # ERA5 temperatures are stored in Kelvin. Temperature spreads have equal
+    # magnitudes in Kelvin and Celsius, so the standard deviation is renamed
+    # without subtracting the absolute-zero offset.
     frame[
         "load_weighted_temperature_c"
     ] = (
@@ -1614,12 +1352,16 @@ def add_temperature_unit_features(
 def add_degree_hour_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add heating and cooling degree-hour transforms."""
+
     frame = frame.copy()
 
     temperature = frame[
         "load_weighted_temperature_c"
     ]
 
+    # Multiple balance points let later models estimate sensitivity without
+    # committing the canonical table to one building-response threshold.
     for base in [
         15.0,
         18.0,
@@ -1656,6 +1398,8 @@ def add_degree_hour_features(
 def add_temperature_nonlinearity_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add squared and cubed temperature transforms."""
+
     frame = frame.copy()
 
     temperature = frame[
@@ -1676,12 +1420,16 @@ def add_temperature_nonlinearity_features(
 def add_temperature_change_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add ex-post current-minus-prior temperature changes."""
+
     frame = frame.copy()
 
     temperature = frame[
         "load_weighted_temperature_c"
     ]
 
+    # These differences include temperature at timestamp t and therefore
+    # describe observed conditions rather than forecast-safe history.
     for lag in [
         1,
         3,
@@ -1701,12 +1449,15 @@ def add_temperature_change_features(
 def add_temperature_rolling_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add rolling temperature fields that include the current hour."""
+
     frame = frame.copy()
 
     temperature = frame[
         "load_weighted_temperature_c"
     ]
 
+    # Names omit "prior" deliberately because each window ends at timestamp t.
     for window in [
         3,
         6,
@@ -1753,6 +1504,8 @@ def add_temperature_rolling_features(
 def add_extreme_temperature_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add nullable threshold flags without hiding missing temperature."""
+
     frame = frame.copy()
 
     temperature = frame[
@@ -1777,14 +1530,15 @@ def add_extreme_temperature_features(
         ),
     }
 
+    # Nullable integers preserve the difference between false and unavailable.
     for (
         column,
         condition,
     ) in thresholds.items():
         frame[column] = (
-            condition.astype(
-                "int8"
-            )
+            condition
+            .where(temperature.notna(), pd.NA)
+            .astype("Int8")
         )
 
     return frame
@@ -1807,6 +1561,10 @@ def add_wind_features(
         "load_weighted_v_wind_10m",
     }
 
+    # Averaging vector components before taking their magnitude captures the
+    # strength and direction of the provincial mean wind vector. It is distinct
+    # from the weighted mean of regional wind-speed magnitudes constructed in
+    # build_monthly_base_weather().
     if required.issubset(
         frame.columns
     ):
@@ -1843,6 +1601,8 @@ def add_wind_features(
 def add_solar_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Convert accumulated radiation and identify observed daylight."""
+
     frame = frame.copy()
 
     radiation = (
@@ -1850,6 +1610,8 @@ def add_solar_features(
         "surface_solar_radiation_downwards"
     )
 
+    # ERA5 radiation is accumulated energy in J/m² over the hour. Dividing by
+    # 3,600 seconds converts it to the hourly mean flux in W/m².
     if radiation in frame.columns:
         frame[
             "load_weighted_solar_radiation_wm2"
@@ -1875,6 +1637,8 @@ def add_solar_features(
 def add_local_time_reference_features(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Add minimal Alberta-local time references."""
+
     frame = frame.copy()
 
     local = (
@@ -1921,19 +1685,6 @@ FEATURE_BUILDERS: list[
 ]
 
 
-def apply_feature_builders(
-    frame: pd.DataFrame,
-) -> pd.DataFrame:
-    output = frame.copy()
-
-    for builder in FEATURE_BUILDERS:
-        output = builder(
-            output
-        )
-
-    return output
-
-
 # ============================================================================
 # Monthly processing
 # ============================================================================
@@ -1947,6 +1698,7 @@ def process_month(
     dict,
     pd.DataFrame,
 ]:
+    """Build and audit the load-weather base table for one ERA5 month."""
     period = monthly_file_period(
         path
     )
@@ -2202,25 +1954,10 @@ def process_month(
         audit_rows
     )
 
-    error_checks = audit_df.loc[
-        audit_df[
-            "severity"
-        ].eq(
-            "error"
-        ),
-        "pass",
-    ]
-
     summary = {
         "period": period,
         "status": "processed",
-        "pass": (
-            bool(
-                error_checks.all()
-            )
-            if not error_checks.empty
-            else True
-        ),
+        "pass": audit_passed(audit_df),
         "rows": len(base),
         "columns": len(base.columns),
         "start": str(
@@ -2254,7 +1991,7 @@ def process_month(
 
 
 # ============================================================================
-# Final audit and output helpers
+# Audit and output helpers
 # ============================================================================
 
 def audit_master_output(
@@ -2378,6 +2115,10 @@ def audit_master_output(
         "load_weighted_temperature_c",
         "hour_alberta",
         "month_alberta",
+        *{
+            f"load_weighted_{variable}"
+            for variable in SOURCE_VARIABLES
+        },
         *REGION_LOAD_COLUMNS.values(),
     }
 
@@ -2397,6 +2138,23 @@ def audit_master_output(
             else "all present"
         ),
         expected="all required columns present",
+    )
+
+    direct_weather_columns = [
+        f"load_weighted_{variable}"
+        for variable in SOURCE_VARIABLES
+        if f"load_weighted_{variable}" in master.columns
+    ]
+    missing_direct_weather_values = int(
+        master[direct_weather_columns].isna().sum().sum()
+    )
+    add_check(
+        rows,
+        period,
+        "final_direct_weather_values_complete",
+        missing_direct_weather_values == 0,
+        observed=missing_direct_weather_values,
+        expected=0,
     )
 
     add_check(
@@ -2535,135 +2293,10 @@ def audit_master_output(
 
     audit = pd.DataFrame(rows)
 
-    error_checks = audit.loc[
-        audit["severity"].eq("error"),
-        "pass",
-    ]
-
-    audit_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
-
     return (
         audit,
-        audit_pass,
+        audit_passed(audit),
     )
-
-
-def save_supporting_outputs(
-    mapping: pd.DataFrame,
-    monthly_summary: pd.DataFrame,
-    audit: pd.DataFrame,
-) -> None:
-    """Write the spatial mapping, monthly summary, and complete audit."""
-
-    ensure_output_directories()
-
-    LOGGER.info(
-        "Writing load-region weather mapping to %s.",
-        LOAD_REGION_MAPPING_FILE,
-    )
-
-    mapping.to_csv(
-        LOAD_REGION_MAPPING_FILE,
-        index=False,
-    )
-
-    LOGGER.info(
-        "Writing monthly processing summary to %s.",
-        MONTHLY_SUMMARY_FILE,
-    )
-
-    monthly_summary.to_csv(
-        MONTHLY_SUMMARY_FILE,
-        index=False,
-    )
-
-    LOGGER.info(
-        "Writing load-weather audit checks to %s.",
-        AUDIT_FILE,
-    )
-
-    audit.to_csv(
-        AUDIT_FILE,
-        index=False,
-    )
-
-
-def save_feature_outputs(
-    master: pd.DataFrame,
-    write_csv: bool,
-) -> None:
-    """Write the canonical Parquet and optional CSV feature outputs."""
-
-    ensure_output_directories()
-
-    LOGGER.info(
-        "Writing canonical load-weather Parquet to %s.",
-        OUTPUT_PARQUET,
-    )
-
-    master.to_parquet(
-        OUTPUT_PARQUET,
-        index=False,
-    )
-
-    if write_csv:
-        LOGGER.info(
-            "Writing optional load-weather CSV to %s.",
-            OUTPUT_CSV,
-        )
-
-        master.to_csv(
-            OUTPUT_CSV,
-            index=False,
-        )
-
-
-def existing_outputs_satisfy_request(
-    write_csv: bool,
-) -> bool:
-    """
-    Return True when all requested canonical feature outputs already exist.
-
-    Parquet is always required. CSV is required only when write_csv=True.
-    """
-
-    return (
-        OUTPUT_PARQUET.exists()
-        and (
-            OUTPUT_CSV.exists()
-            if write_csv
-            else True
-        )
-    )
-
-
-def read_existing_parquet_for_csv() -> pd.DataFrame:
-    """
-    Load the existing canonical Parquet when only the optional CSV is missing.
-
-    This avoids repeating the expensive month-by-month NetCDF extraction.
-    """
-
-    LOGGER.info(
-        "Loading existing load-weather Parquet from %s.",
-        OUTPUT_PARQUET,
-    )
-
-    master = pd.read_parquet(
-        OUTPUT_PARQUET
-    )
-
-    if "timestamp_utc" in master.columns:
-        master["timestamp_utc"] = pd.to_datetime(
-            master["timestamp_utc"],
-            utc=True,
-        )
-
-    return master
 
 
 # ============================================================================
@@ -2699,7 +2332,7 @@ def print_pipeline_report(
 
 
 # ============================================================================
-# Full pipeline
+# Pipeline
 # ============================================================================
 
 def build_load_weather_features(
@@ -2722,7 +2355,21 @@ def build_load_weather_features(
     LOGGER.debug("Feature output directory: %s", OUTPUT_DIR)
     LOGGER.debug("Audit output directory: %s", AUDIT_DIR)
 
-    ensure_output_directories()
+    ensure_directories(OUTPUT_DIR, AUDIT_DIR)
+    monthly_files = get_monthly_files(ERA5_MONTHLY_DIR)
+    source_paths = [AREA_LOAD_FILE, *monthly_files]
+    if LOAD_REGIONS_FILE.exists():
+        source_paths.append(LOAD_REGIONS_FILE)
+    expected_manifest = build_manifest(
+        dataset=DATASET_NAME,
+        source_paths=source_paths,
+        code_paths=feature_code_paths(Path(__file__)),
+        configuration={
+            "feature_information_policy": FEATURE_INFORMATION_POLICY,
+            "source_variables": SOURCE_VARIABLES,
+            "timezone": TIMEZONE,
+        },
+    )
 
     # ------------------------------------------------------------------------
     # Existing-output handling
@@ -2730,8 +2377,16 @@ def build_load_weather_features(
 
     if (
         not overwrite
-        and existing_outputs_satisfy_request(
-            write_csv=write_csv
+        and outputs_satisfy_request(
+            OUTPUT_PARQUET,
+            OUTPUT_CSV,
+            write_csv=write_csv,
+            expected_manifest=expected_manifest,
+            required_artifacts=[
+                LOAD_REGION_MAPPING_FILE,
+                MONTHLY_SUMMARY_FILE,
+                AUDIT_FILE,
+            ],
         )
     ):
         LOGGER.info(
@@ -2777,11 +2432,11 @@ def build_load_weather_features(
     # repeating all NetCDF extraction and monthly weighting.
     if (
         not overwrite
-        and OUTPUT_PARQUET.exists()
+        and output_is_current(OUTPUT_PARQUET, expected_manifest)
         and write_csv
         and not OUTPUT_CSV.exists()
     ):
-        master = read_existing_parquet_for_csv()
+        master = read_existing_parquet(OUTPUT_PARQUET)
 
         LOGGER.info(
             "Creating missing CSV from existing canonical Parquet."
@@ -2791,6 +2446,7 @@ def build_load_weather_features(
             OUTPUT_CSV,
             index=False,
         )
+        write_manifest(OUTPUT_CSV, expected_manifest)
 
         return {
             "dataset": DATASET_NAME,
@@ -2831,10 +2487,6 @@ def build_load_weather_features(
     # ------------------------------------------------------------------------
     # Inputs and spatial mapping
     # ------------------------------------------------------------------------
-
-    monthly_files = get_monthly_files(
-        ERA5_MONTHLY_DIR
-    )
 
     LOGGER.info(
         "Found %s monthly ERA5 files.",
@@ -3000,10 +2652,12 @@ def build_load_weather_features(
     )
 
     if not outputs:
-        save_supporting_outputs(
-            mapping=mapping,
-            monthly_summary=monthly_summary_df,
-            audit=monthly_audit_df,
+        save_tables(
+            {
+                LOAD_REGION_MAPPING_FILE: mapping,
+                MONTHLY_SUMMARY_FILE: monthly_summary_df,
+                AUDIT_FILE: monthly_audit_df,
+            },
         )
 
         raise RuntimeError(
@@ -3056,9 +2710,7 @@ def build_load_weather_features(
     #
     # This is important for lagged and rolling temperature features because it
     # allows them to flow continuously across month boundaries.
-    master = apply_feature_builders(
-        master
-    )
+    master = run_feature_builders(master, FEATURE_BUILDERS)
 
     final_audit_df, final_audit_pass = audit_master_output(
         master
@@ -3072,22 +2724,15 @@ def build_load_weather_features(
         ignore_index=True,
     )
 
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
-
-    overall_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    overall_pass = audit_passed(audit_df)
 
     # Always save the mapping and audit evidence, including after a failed run.
-    save_supporting_outputs(
-        mapping=mapping,
-        monthly_summary=monthly_summary_df,
-        audit=audit_df,
+    save_tables(
+        {
+            LOAD_REGION_MAPPING_FILE: mapping,
+            MONTHLY_SUMMARY_FILE: monthly_summary_df,
+            AUDIT_FILE: audit_df,
+        },
     )
 
     if not overall_pass or not final_audit_pass:
@@ -3133,10 +2778,17 @@ def build_load_weather_features(
     # Canonical feature output
     # ------------------------------------------------------------------------
 
-    save_feature_outputs(
+    write_feature_outputs(
         master,
-        write_csv=write_csv,
+        OUTPUT_PARQUET,
+        OUTPUT_CSV,
+        write_csv,
+        "load-weather feature",
+        manifest=expected_manifest,
     )
+    for artifact in [LOAD_REGION_MAPPING_FILE, MONTHLY_SUMMARY_FILE, AUDIT_FILE]:
+        write_manifest(artifact, expected_manifest)
+    provenance_file = write_manifest(OUTPUT_PARQUET, expected_manifest)
 
     processing_seconds = round(
         time.perf_counter()
@@ -3194,6 +2846,7 @@ def build_load_weather_features(
         "audit_file": str(
             AUDIT_FILE
         ),
+        "manifest_file": str(provenance_file),
         "processing_seconds": processing_seconds,
     }
 

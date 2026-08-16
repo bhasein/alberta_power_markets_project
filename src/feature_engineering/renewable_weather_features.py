@@ -34,9 +34,10 @@ The normalized project weight is:
 Projects therefore contribute nothing before commissioning or after
 retirement.
 
-Project phases should be represented as separate project rows. For example,
-a wind facility expanded in 2019 and 2022 should have separate rows for each
-capacity phase, each with its own commissioning date.
+Project phases are represented as separate rows. Exact commissioning dates
+are used when available. A source that contains only ``commissioning_year``
+is retained as an explicitly flagged year-level estimate beginning January 1;
+the output records how many active projects use estimated dates.
 
 Expected project registry columns
 ---------------------------------
@@ -46,7 +47,8 @@ fuel_type
 latitude
 longitude
 capacity_mw
-commissioning_date
+commissioning_date       preferred
+commissioning_year       accepted fallback
 retirement_date       optional
 
 Supported fuel_type values:
@@ -55,10 +57,10 @@ solar
 
 Outputs
 -------
-data/features/weather/renewable_weather_features_hourly.parquet
-data/features/weather/renewable_project_weather_mapping.csv
-data/audits/weather_features_monthly_summary.csv
-data/audits/weather_features_audit_checks.csv
+data/processed/feature_engineering/weather/renewable_weather_features_hourly.parquet
+data/audits/feature_engineering/renewable_project_weather_mapping.csv
+data/audits/feature_engineering/weather_features_monthly_summary.csv
+data/audits/feature_engineering/weather_features_audit_checks.csv
 
 Run
 ---
@@ -67,19 +69,83 @@ python src/feature_engineering/renewable_weather_features.py
 or:
 
 .venv/bin/python src/feature_engineering/renewable_weather_features.py
+
+Information timing
+------------------
+ERA5 values are contemporaneous observed weather. They are explanatory
+features unless replaced with weather forecasts for operational modeling.
 """
 
+# ============================================================================
 # Imports
+# ============================================================================
+
 from __future__ import annotations
+
 import argparse
-import calendar
 import logging
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+try:
+    from .shared import (
+        add_period_check as add_check,
+        audit_passed,
+        build_manifest,
+        configure_logging,
+        ensure_directories,
+        feature_code_paths,
+        ensure_src_on_path,
+        existing_outputs_satisfy_request as outputs_satisfy_request,
+        expected_month_hours,
+        get_monthly_files,
+        haversine_distance_km,
+        load_grid,
+        monthly_file_period,
+        nearest_coordinate,
+        output_is_current,
+        require_columns,
+        safe_divide as safe_ratio,
+        save_feature_outputs as write_feature_outputs,
+        save_tables,
+        weather_array,
+        weighted_average as weighted_project_average,
+        weighted_standard_deviation as weighted_project_standard_deviation,
+        write_manifest,
+    )
+except ImportError:  # Support direct execution of this file.
+    from shared import (
+        add_period_check as add_check,
+        audit_passed,
+        build_manifest,
+        configure_logging,
+        ensure_directories,
+        feature_code_paths,
+        ensure_src_on_path,
+        existing_outputs_satisfy_request as outputs_satisfy_request,
+        expected_month_hours,
+        get_monthly_files,
+        haversine_distance_km,
+        load_grid,
+        monthly_file_period,
+        nearest_coordinate,
+        output_is_current,
+        require_columns,
+        safe_divide as safe_ratio,
+        save_feature_outputs as write_feature_outputs,
+        save_tables,
+        weather_array,
+        weighted_average as weighted_project_average,
+        weighted_standard_deviation as weighted_project_standard_deviation,
+        write_manifest,
+    )
+
+ensure_src_on_path(__file__)
 
 
 # ============================================================================
@@ -88,44 +154,18 @@ import xarray as xr
 
 LOGGER = logging.getLogger(__name__)
 
-
-def configure_logging(
-    verbose: bool = False,
-) -> None:
-    """Configure console logging for the pipeline."""
-
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-
-
 # ============================================================================
-# Paths
+# Project paths
 # ============================================================================
-
-# This file is expected to live at:
-#
-#     PROJECT_ROOT/src/feature_engineering/renewable_weather_features.py
-#
-# parents[0] -> feature_engineering
-# parents[1] -> src
-# parents[2] -> project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-PREPROCESSING_DIR = PROJECT_ROOT / "data" / "preprocessing"
-FEATURES_DIR = PROJECT_ROOT / "data" / "features"
-OUTPUT_DIR = FEATURES_DIR / "weather"
-AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
-
-ERA5_MONTHLY_DIR = (
-    PREPROCESSING_DIR
-    / "weather"
-    / "era5"
-    / "monthly_standardized"
+from config import (
+    PROJECT_ROOT,
+    PREPROCESSING_DIR,
+    FEATURES_DIR,
+    FEATURE_ENGINEERING_AUDITS_DIR as AUDIT_DIR,
+    ERA5_MONTHLY_STANDARDIZED_DIR as ERA5_MONTHLY_DIR,
 )
+
+OUTPUT_DIR = FEATURES_DIR / "weather"
 
 WIND_PROJECTS_FILE = (
     PREPROCESSING_DIR
@@ -165,12 +205,15 @@ AUDIT_FILE = (
     / "weather_features_audit_checks.csv"
 )
 
-
+# ============================================================================
 # Configuration
+# ============================================================================
+
 VALID_FUEL_TYPES = {
     "wind",
     "solar",
 }
+FEATURE_INFORMATION_POLICY = "contemporaneous_observed_weather"
 
 # Variables used directly or in engineered features for wind.
 WIND_SOURCE_VARIABLES = [
@@ -209,7 +252,7 @@ SOLAR_SOURCE_VARIABLES = [
     "snow_depth",
 ]
 
-# Create a sorted set of wind and solar source variables
+# Union of variables required by either fleet-specific feature builder.
 ALL_SOURCE_VARIABLES = sorted(set(WIND_SOURCE_VARIABLES + SOLAR_SOURCE_VARIABLES))
 
 WIND_DIRECT_WEIGHT_VARIABLES = [
@@ -238,92 +281,10 @@ AIR_GAS_CONSTANT = 287.05
 
 
 
-# General helpers
-def add_check(
-    rows: list[dict],
-    period: str,
-    check: str,
-    passed: bool,
-    observed=None,
-    expected=None,
-    severity: str = "error",
-    notes: str = "",
-) -> None:
-    """Append one audit check."""
-
-    # Append dictionary to rows
-    rows.append(
-        {
-            "period": period,
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        }
-    )
-
-
-def require_columns(
-    dataframe: pd.DataFrame,
-    required_columns: Iterable[str],
-    dataset_name: str,
-) -> None:
-    """Validate that a dataframe contains required columns."""
-
-    # store missing columns
-    missing = sorted(
-        set(required_columns) - set(dataframe.columns)
-    )
-
-    # if columns are missing, raise an error and print them
-    if missing:
-        raise ValueError(
-            f"{dataset_name} is missing required columns: {missing}"
-        )
-
-
-def monthly_file_period(path: Path) -> str:
-    """
-    Extract YYYY-MM from a standardized monthly filename.
-
-    Expected filename:
-        era5_alberta_standardized_2020_01.nc
-    """
-
-    # stem returns file name without the extension, and splits the file name between the "_"
-    parts = path.stem.split("_")
-
-    # raise error if the length of the resulting list is not long enough
-    if len(parts) < 2:
-        raise ValueError(
-            f"Cannot identify year and month from {path.name}"
-        )
-
-    # store year and month value (last and second last values)
-    year = parts[-2]
-    month = parts[-1]
-
-    # return string of year-month
-    return f"{year}-{month}"
-
-
-def expected_month_hours(period: str) -> int:
-    """Return expected number of hourly timestamps in a month."""
-
-    # split and store year/month in a list, converted to ints
-    year, month = map(int, period.split("-"))
-
-    # monthrange returns a tuple
-    # pick second value of the typle (days) and multiply by 24
-    return (
-        calendar.monthrange(year, month)[1]
-        * 24
-    )
-
-
+# ============================================================================
 # Project registry
+# ============================================================================
+
 def normalize_project_columns(
     projects: pd.DataFrame,
     fuel_type: str,
@@ -353,10 +314,9 @@ def normalize_project_columns(
         longitude
     """
 
-    # create new copy of projects file
     projects = projects.copy()
 
-    # strip whitespace, convert to lowercase, replace separation with "_", stip "_" on the edge
+    # Normalize source headings once at the ingestion boundary.
     projects.columns = (
         projects.columns
         .str.strip()
@@ -365,7 +325,8 @@ def normalize_project_columns(
         .str.strip("_")
     )
 
-    # Wind file already has an identifier.
+    # Wind generally has an identifier; solar identifiers are generated from
+    # names. A stable fuel prefix prevents cross-fuel collisions.
     if "project_identifier" in projects.columns:
         projects = projects.rename(
             columns={
@@ -373,7 +334,6 @@ def normalize_project_columns(
             }
         )
 
-    # Solar has no identifier, so generate one from project_name.
     if "project_id" not in projects.columns:
         normalized_name = (
             projects["project_name"]
@@ -394,20 +354,50 @@ def normalize_project_columns(
             + normalized_name
         )
 
+    projects["facility_id"] = projects["project_id"].astype("string")
+
     projects["fuel_type"] = fuel_type
 
-    projects["commissioning_year"] = pd.to_numeric(
-        projects["commissioning_year"],
-        errors="coerce",
+    exact_dates = (
+        pd.to_datetime(
+            projects["commissioning_date"],
+            errors="coerce",
+            utc=True,
+        )
+        if "commissioning_date" in projects.columns
+        else pd.Series(pd.NaT, index=projects.index, dtype="datetime64[ns, UTC]")
     )
 
-    projects["commissioning_date"] = pd.to_datetime(
+    commissioning_year = pd.to_numeric(
         projects["commissioning_year"]
-        .astype("Int64")
-        .astype("string")
-        + "-01-01",
+        if "commissioning_year" in projects.columns
+        else pd.Series(np.nan, index=projects.index),
+        errors="coerce",
+    )
+    estimated_dates = pd.to_datetime(
+        commissioning_year.astype("Int64").astype("string") + "-01-01",
         errors="coerce",
         utc=True,
+    )
+    projects["commissioning_date"] = exact_dates.fillna(estimated_dates)
+    projects["commissioning_date_precision"] = np.where(
+        exact_dates.notna(),
+        "exact_date",
+        "year_estimate",
+    )
+
+    # Make every phase independently addressable without rejecting multiple
+    # capacity additions for the same facility.
+    phase_number = projects.groupby("facility_id", sort=False).cumcount() + 1
+    phase_count = projects.groupby("facility_id", sort=False)["facility_id"].transform(
+        "size"
+    )
+    projects["project_id"] = np.where(
+        phase_count.gt(1),
+        projects["facility_id"].astype(str)
+        + "__PHASE_"
+        + phase_number.astype(str),
+        projects["facility_id"].astype(str),
     )
 
     if "retirement_date" not in projects.columns:
@@ -518,7 +508,7 @@ def load_project_file(
             f"{invalid.to_string(index=False)}"
         )
 
-    # Commissioning year is necessary for historical weighting.
+    # Historical weighting requires either an exact date or a source year.
     if projects["commissioning_date"].isna().any():
         invalid = projects.loc[
             projects["commissioning_date"].isna(),
@@ -531,8 +521,8 @@ def load_project_file(
         ]
 
         raise ValueError(
-            f"{fuel_type.capitalize()} projects are missing commissioning years. "
-            "Fill these before building historical weather weights:\n"
+            f"{fuel_type.capitalize()} projects are missing commissioning dates "
+            "and years. Fill one before building historical weather weights:\n"
             f"{invalid.to_string(index=False)}"
         )
 
@@ -632,118 +622,6 @@ def load_projects(
 # ERA5 spatial grid mapping
 # ============================================================================
 
-def get_monthly_files(
-    monthly_dir: Path,
-) -> list[Path]:
-    """Return standardized monthly ERA5 files in chronological order."""
-
-    files = sorted(
-        monthly_dir.glob(
-            "era5_alberta_standardized_*.nc"
-        )
-    )
-
-    if not files:
-        raise FileNotFoundError(
-            f"No standardized monthly ERA5 files found in "
-            f"{monthly_dir}"
-        )
-
-    return files
-
-
-def load_grid(reference_file: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load latitude and longitude arrays from one ERA5 file."""
-
-    with xr.open_dataset(reference_file) as ds:
-        required_coordinates = {
-            "timestamp",
-            "lat",
-            "lon",
-        }
-
-        missing = (
-            required_coordinates
-            - set(ds.coords)
-            - set(ds.dims)
-        )
-
-        if missing:
-            raise ValueError(
-                f"{reference_file.name} is missing coordinates: "
-                f"{sorted(missing)}"
-            )
-
-        latitudes = np.asarray(
-            ds["lat"].values,
-            dtype=float,
-        )
-
-        longitudes = np.asarray(
-            ds["lon"].values,
-            dtype=float,
-        )
-
-    return latitudes, longitudes
-
-
-def nearest_coordinate(
-    value: float,
-    available_coordinates: np.ndarray,
-) -> tuple[float, int]:
-    """Return the nearest coordinate value and its array position."""
-
-    position = int(
-        np.abs(
-            available_coordinates - value
-        ).argmin()
-    )
-
-    return (
-        float(available_coordinates[position]),
-        position,
-    )
-
-
-def approximate_distance_km(
-    project_latitude: float,
-    project_longitude: float,
-    grid_latitude: float,
-    grid_longitude: float,
-) -> float:
-    """
-    Calculate approximate great-circle distance using the haversine formula.
-    """
-
-    earth_radius_km = 6371.0088
-
-    lat1 = np.radians(project_latitude)
-    lon1 = np.radians(project_longitude)
-    lat2 = np.radians(grid_latitude)
-    lon2 = np.radians(grid_longitude)
-
-    delta_lat = lat2 - lat1
-    delta_lon = lon2 - lon1
-
-    haversine_value = (
-        np.sin(delta_lat / 2.0) ** 2
-        + np.cos(lat1)
-        * np.cos(lat2)
-        * np.sin(delta_lon / 2.0) ** 2
-    )
-
-    central_angle = (
-        2.0
-        * np.arcsin(
-            np.sqrt(haversine_value)
-        )
-    )
-
-    return float(
-        earth_radius_km * central_angle
-    )
-
-
 def map_projects_to_grid(
     projects: pd.DataFrame,
     latitudes: np.ndarray,
@@ -770,11 +648,11 @@ def map_projects_to_grid(
             longitudes,
         )
 
-        distance = approximate_distance_km(
-            project_latitude=float(row.latitude),
-            project_longitude=float(row.longitude),
-            grid_latitude=weather_lat,
-            grid_longitude=weather_lon,
+        distance = haversine_distance_km(
+            float(row.latitude),
+            float(row.longitude),
+            weather_lat,
+            weather_lon,
         )
 
         weather_latitudes.append(weather_lat)
@@ -877,53 +755,22 @@ def extract_project_sites(
         },
     )
 
-    available_variables = [
-        variable
-        for variable in ALL_SOURCE_VARIABLES
-        if variable in ds.data_vars
-    ]
-
-    if not available_variables:
+    missing_variables = sorted(
+        set(ALL_SOURCE_VARIABLES) - set(ds.data_vars)
+    )
+    if missing_variables:
         raise ValueError(
-            "Monthly ERA5 file contains none of the configured "
-            "weather variables."
+            "Monthly ERA5 file is missing required renewable-weather "
+            f"variables: {missing_variables}"
         )
 
-    extracted = ds[available_variables].sel(
+    extracted = ds[ALL_SOURCE_VARIABLES].sel(
         lat=lat_indexer,
         lon=lon_indexer,
         method="nearest",
     )
 
     return extracted
-
-
-def weather_array(
-    site_dataset: xr.Dataset,
-    variable: str,
-) -> np.ndarray | None:
-    """
-    Return a weather variable as timestamp × site.
-
-    Returns None when the variable is unavailable.
-    """
-
-    if variable not in site_dataset.data_vars:
-        return None
-
-    array = (
-        site_dataset[variable]
-        .transpose(
-            "timestamp",
-            "weather_site_id",
-        )
-        .values
-    )
-
-    return np.asarray(
-        array,
-        dtype=float,
-    )
 
 
 # ============================================================================
@@ -946,8 +793,11 @@ def active_capacity_matrix(
     )[:, None]
 
     commissioning = (
-        projects["commissioning_date"]
-        .dt.tz_convert("UTC")
+        pd.to_datetime(
+            projects["commissioning_date"],
+            utc=True,
+            errors="raise",
+        )
         .dt.tz_localize(None)
         .to_numpy(dtype="datetime64[ns]")
     )[None, :]
@@ -955,8 +805,11 @@ def active_capacity_matrix(
     retirement_series = projects["retirement_date"]
 
     retirement = (
-        retirement_series
-        .dt.tz_convert("UTC")
+        pd.to_datetime(
+            retirement_series,
+            utc=True,
+            errors="coerce",
+        )
         .dt.tz_localize(None)
         .fillna(
             pd.Timestamp.max.tz_localize(None)
@@ -992,106 +845,6 @@ def project_values_from_sites(
     )
 
     return site_values[:, project_site_positions]
-
-
-def weighted_project_average(
-    project_values: np.ndarray,
-    active_capacity: np.ndarray,
-) -> np.ndarray:
-    """
-    Compute hourly capacity-weighted average while handling missing weather.
-
-    Missing project weather is removed from both numerator and denominator
-    for the corresponding hour.
-    """
-
-    valid = np.isfinite(project_values)
-
-    valid_capacity = np.where(
-        valid,
-        active_capacity,
-        0.0,
-    )
-
-    numerator = np.nansum(
-        project_values * valid_capacity,
-        axis=1,
-    )
-
-    denominator = np.sum(
-        valid_capacity,
-        axis=1,
-    )
-
-    result = np.full(
-        project_values.shape[0],
-        np.nan,
-        dtype=float,
-    )
-
-    np.divide(
-        numerator,
-        denominator,
-        out=result,
-        where=denominator > 0,
-    )
-
-    return result
-
-
-def weighted_project_standard_deviation(
-    project_values: np.ndarray,
-    active_capacity: np.ndarray,
-) -> np.ndarray:
-    """
-    Compute hourly capacity-weighted cross-project standard deviation.
-
-    This indicates how geographically uniform or dispersed wind conditions
-    are across the active fleet.
-    """
-
-    weighted_mean = weighted_project_average(
-        project_values,
-        active_capacity,
-    )
-
-    valid = np.isfinite(project_values)
-
-    valid_capacity = np.where(
-        valid,
-        active_capacity,
-        0.0,
-    )
-
-    squared_deviation = (
-        project_values
-        - weighted_mean[:, None]
-    ) ** 2
-
-    numerator = np.nansum(
-        squared_deviation * valid_capacity,
-        axis=1,
-    )
-
-    denominator = np.sum(
-        valid_capacity,
-        axis=1,
-    )
-
-    result = np.full(
-        project_values.shape[0],
-        np.nan,
-        dtype=float,
-    )
-
-    np.divide(
-        numerator,
-        denominator,
-        out=result,
-        where=denominator > 0,
-    )
-
-    return np.sqrt(result)
 
 
 def wind_speed(
@@ -1131,34 +884,6 @@ def meteorological_wind_direction(
     ) % 360.0
 
 
-def safe_ratio(
-    numerator: np.ndarray,
-    denominator: np.ndarray,
-) -> np.ndarray:
-    """Divide two arrays while avoiding division by zero."""
-
-    result = np.full(
-        numerator.shape,
-        np.nan,
-        dtype=float,
-    )
-
-    valid = (
-        np.isfinite(numerator)
-        & np.isfinite(denominator)
-        & (denominator != 0)
-    )
-
-    np.divide(
-        numerator,
-        denominator,
-        out=result,
-        where=valid,
-    )
-
-    return result
-
-
 # ============================================================================
 # Fuel-specific feature construction
 # ============================================================================
@@ -1173,6 +898,8 @@ def add_direct_weighted_variables(
 ) -> None:
     """Add direct capacity-weighted weather variables to output."""
 
+    # Direct fields are weighted over the active fleet independently for each
+    # hour. Missing project weather is removed from both numerator and weight.
     for variable in variables:
         site_values = weather_array(
             site_dataset,
@@ -1212,9 +939,12 @@ def build_wind_features(
         output["wind_installed_capacity_mw"] = 0.0
         output["wind_active_project_count"] = 0
         output["wind_active_weather_site_count"] = 0
+        output["wind_estimated_commissioning_project_count"] = 0
 
         return output
 
+    # Historical capacity determines both the fleet totals and every weather
+    # weight. Projects contribute nothing outside their operating interval.
     active_capacity = active_capacity_matrix(
         timestamps,
         projects,
@@ -1230,6 +960,19 @@ def build_wind_features(
         .astype(int)
     )
 
+    # Retain visible evidence of projects whose activation is estimated from
+    # commissioning year rather than known to an exact source date.
+    estimated_commissioning = projects[
+        "commissioning_date_precision"
+    ].eq("year_estimate").to_numpy()
+    output["wind_estimated_commissioning_project_count"] = (
+        ((active_capacity > 0) & estimated_commissioning[None, :])
+        .sum(axis=1)
+        .astype(int)
+    )
+
+    # Several projects can share one ERA5 grid cell, so site count is measured
+    # separately from project count.
     site_ids = projects[
         "weather_site_id"
     ].to_numpy(dtype=int)
@@ -1272,6 +1015,8 @@ def build_wind_features(
         "v_wind_100m",
     )
 
+    # Compute speed at each project before capacity weighting. This preserves
+    # wind-speed magnitude and supports squared/cubed generation-response terms.
     if (
         u100_sites is not None
         and v100_sites is not None
@@ -1353,6 +1098,8 @@ def build_wind_features(
         "v_wind_10m",
     )
 
+    # Ten-metre fields provide near-surface context and enable a simple shear
+    # comparison with the generation-relevant 100-metre level.
     if (
         u10_sites is not None
         and v10_sites is not None
@@ -1410,6 +1157,7 @@ def build_wind_features(
             weighted_v10,
         )
 
+    # Speed shear and ratios describe vertical wind-profile differences.
     if (
         "wind_capacity_weighted_speed_100m"
         in output.columns
@@ -1438,6 +1186,7 @@ def build_wind_features(
             ].to_numpy(dtype=float),
         )
 
+    # The ideal-gas approximation uses pressure in Pa and temperature in K.
     if (
         "wind_capacity_weighted_surface_pressure"
         in output.columns
@@ -1478,9 +1227,11 @@ def build_solar_features(
         output["solar_installed_capacity_mw"] = 0.0
         output["solar_active_project_count"] = 0
         output["solar_active_weather_site_count"] = 0
+        output["solar_estimated_commissioning_project_count"] = 0
 
         return output
 
+    # Use the same historical activation and audit conventions as wind.
     active_capacity = active_capacity_matrix(
         timestamps,
         projects,
@@ -1492,6 +1243,15 @@ def build_solar_features(
 
     output["solar_active_project_count"] = (
         (active_capacity > 0)
+        .sum(axis=1)
+        .astype(int)
+    )
+
+    estimated_commissioning = projects[
+        "commissioning_date_precision"
+    ].eq("year_estimate").to_numpy()
+    output["solar_estimated_commissioning_project_count"] = (
+        ((active_capacity > 0) & estimated_commissioning[None, :])
         .sum(axis=1)
         .astype(int)
     )
@@ -1538,9 +1298,9 @@ def build_solar_features(
         "surface_solar_radiation_downwards_clear_sky"
     )
 
+    # ERA5 accumulated radiation is J/m² over the hour; dividing by 3,600
+    # converts it to the hourly mean W/m².
     if radiation_column in output.columns:
-        # ERA5 accumulated radiation is normally J/m² over the hour.
-        # Dividing by 3600 gives the hourly mean W/m².
         output[
             "solar_capacity_weighted_radiation_wm2"
         ] = (
@@ -1548,6 +1308,8 @@ def build_solar_features(
             / 3600.0
         )
 
+    # The clear-sky ratio is dimensionless and missing when its denominator is
+    # zero, including nighttime hours.
     if (
         radiation_column in output.columns
         and clear_sky_column in output.columns
@@ -1778,25 +1540,8 @@ def process_month(
 
 
 # ============================================================================
-# Output and final-audit helpers
+# Audit and output helpers
 # ============================================================================
-
-def ensure_output_directories() -> None:
-    """Create feature and audit output directories."""
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def error_checks_pass(audit: pd.DataFrame) -> bool:
-    """Return True when all error-level audit checks pass."""
-
-    if audit.empty or "severity" not in audit.columns:
-        return True
-
-    checks = audit.loc[audit["severity"].eq("error"), "pass"]
-    return bool(checks.all()) if not checks.empty else True
-
 
 def audit_final_weather_features(
     frame: pd.DataFrame,
@@ -1847,6 +1592,16 @@ def audit_final_weather_features(
         "solar_installed_capacity_mw",
         "solar_active_project_count",
         "solar_active_weather_site_count",
+        "wind_estimated_commissioning_project_count",
+        "solar_estimated_commissioning_project_count",
+        *{
+            f"wind_capacity_weighted_{variable}"
+            for variable in WIND_DIRECT_WEIGHT_VARIABLES
+        },
+        *{
+            f"solar_capacity_weighted_{variable}"
+            for variable in SOLAR_DIRECT_WEIGHT_VARIABLES
+        },
     }
     missing_columns = sorted(required_columns - set(frame.columns))
     add_check(
@@ -1865,67 +1620,94 @@ def audit_final_weather_features(
 
         if capacity_column in frame.columns:
             negative = int((frame[capacity_column] < 0).sum())
-            add_check(rows, "final", f"{fuel}_capacity_non_negative", negative == 0, negative, 0)
+            add_check(
+                rows, "final", f"{fuel}_capacity_non_negative", negative == 0,
+                negative, 0,
+            )
 
         if project_count_column in frame.columns:
             negative = int((frame[project_count_column] < 0).sum())
-            add_check(rows, "final", f"{fuel}_project_count_non_negative", negative == 0, negative, 0)
+            add_check(
+                rows, "final", f"{fuel}_project_count_non_negative",
+                negative == 0, negative, 0,
+            )
 
         if site_count_column in frame.columns:
             negative = int((frame[site_count_column] < 0).sum())
-            add_check(rows, "final", f"{fuel}_site_count_non_negative", negative == 0, negative, 0)
+            add_check(
+                rows, "final", f"{fuel}_site_count_non_negative",
+                negative == 0, negative, 0,
+            )
 
         if {project_count_column, site_count_column}.issubset(frame.columns):
-            invalid = int((frame[site_count_column] > frame[project_count_column]).sum())
-            add_check(rows, "final", f"{fuel}_site_count_not_above_project_count", invalid == 0, invalid, 0)
+            invalid = int(
+                (frame[site_count_column] > frame[project_count_column]).sum()
+            )
+            add_check(
+                rows, "final", f"{fuel}_site_count_not_above_project_count",
+                invalid == 0, invalid, 0,
+            )
+
+        active_mask = frame[capacity_column].gt(0)
+        direct_prefix = f"{fuel}_capacity_weighted_"
+        direct_columns = [
+            column
+            for column in frame.columns
+            if column.startswith(direct_prefix)
+            and not column.endswith(("_squared", "_cubed", "_air_density"))
+        ]
+        missing_active_weather = int(
+            frame.loc[active_mask, direct_columns].isna().sum().sum()
+        )
+        add_check(
+            rows,
+            "final",
+            f"{fuel}_active_weather_complete",
+            missing_active_weather == 0,
+            missing_active_weather,
+            0,
+        )
 
     return pd.DataFrame(rows)
 
 
-def save_supporting_outputs(
-    project_mapping: pd.DataFrame,
-    monthly_summary: pd.DataFrame,
-    audit: pd.DataFrame,
-) -> None:
-    """Save mapping and audit outputs before canonical feature output."""
-
-    project_mapping.to_csv(PROJECT_MAPPING_FILE, index=False)
-    monthly_summary.to_csv(MONTHLY_SUMMARY_FILE, index=False)
-    audit.to_csv(AUDIT_FILE, index=False)
-
-    LOGGER.info("Saved project mapping: %s", PROJECT_MAPPING_FILE)
-    LOGGER.info("Saved monthly summary: %s", MONTHLY_SUMMARY_FILE)
-    LOGGER.info("Saved audit checks: %s", AUDIT_FILE)
-
-
-def save_feature_outputs(
-    frame: pd.DataFrame,
-    write_csv: bool,
-) -> None:
-    """Save canonical Parquet and optional CSV outputs."""
-
-    frame.to_parquet(OUTPUT_PARQUET, index=False)
-    LOGGER.info("Saved Parquet output: %s", OUTPUT_PARQUET)
-
-    if write_csv:
-        frame.to_csv(OUTPUT_CSV, index=False)
-        LOGGER.info("Saved CSV output: %s", OUTPUT_CSV)
-
-
 def existing_output_result(
     write_csv: bool,
+    expected_manifest: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Handle an existing canonical output without rebuilding NetCDF months."""
 
-    if not OUTPUT_PARQUET.exists():
+    output_complete = outputs_satisfy_request(
+        OUTPUT_PARQUET,
+        OUTPUT_CSV,
+        write_csv,
+        expected_manifest,
+        required_artifacts=[
+            PROJECT_MAPPING_FILE,
+            MONTHLY_SUMMARY_FILE,
+            AUDIT_FILE,
+        ],
+    )
+    evidence_paths = [PROJECT_MAPPING_FILE, MONTHLY_SUMMARY_FILE, AUDIT_FILE]
+    evidence_current = all(
+        output_is_current(path, expected_manifest)
+        for path in evidence_paths
+    )
+    if not output_complete and (
+        not output_is_current(OUTPUT_PARQUET, expected_manifest)
+        or not evidence_current
+    ):
         return None
 
     frame: pd.DataFrame | None = None
 
-    if write_csv and not OUTPUT_CSV.exists():
-        LOGGER.info("Parquet exists; creating the requested CSV without rebuilding features.")
+    if write_csv and not output_is_current(OUTPUT_CSV, expected_manifest):
+        LOGGER.info(
+            "Parquet exists; creating the requested CSV without rebuilding."
+        )
         frame = pd.read_parquet(OUTPUT_PARQUET)
         frame.to_csv(OUTPUT_CSV, index=False)
+        write_manifest(OUTPUT_CSV, expected_manifest)
 
     if frame is None:
         frame = pd.read_parquet(OUTPUT_PARQUET, columns=["timestamp_utc"])
@@ -1955,14 +1737,32 @@ def build_weather_features(
     """Run the complete renewable-weather feature pipeline."""
 
     pipeline_start = time.perf_counter()
-    ensure_output_directories()
+    ensure_directories(OUTPUT_DIR, AUDIT_DIR)
+
+    monthly_files = get_monthly_files(ERA5_MONTHLY_DIR)
+    expected_manifest = build_manifest(
+        dataset="renewable_weather_features",
+        source_paths=[
+            WIND_PROJECTS_FILE,
+            SOLAR_PROJECTS_FILE,
+            *monthly_files,
+        ],
+        code_paths=feature_code_paths(Path(__file__)),
+        configuration={
+            "feature_information_policy": FEATURE_INFORMATION_POLICY,
+            "source_variables": ALL_SOURCE_VARIABLES,
+            "commissioning_year_fallback": "january_1_flagged_estimate",
+        },
+    )
 
     if not overwrite:
-        existing = existing_output_result(write_csv=write_csv)
+        existing = existing_output_result(
+            write_csv=write_csv,
+            expected_manifest=expected_manifest,
+        )
         if existing is not None:
             return existing
 
-    monthly_files = get_monthly_files(ERA5_MONTHLY_DIR)
     projects = load_projects(
         wind_path=WIND_PROJECTS_FILE,
         solar_path=SOLAR_PROJECTS_FILE,
@@ -1976,8 +1776,14 @@ def build_weather_features(
     )
 
     LOGGER.info("Projects loaded: %s", f"{len(project_mapping):,}")
-    LOGGER.info("Wind projects: %s", f"{project_mapping['fuel_type'].eq('wind').sum():,}")
-    LOGGER.info("Solar projects: %s", f"{project_mapping['fuel_type'].eq('solar').sum():,}")
+    LOGGER.info(
+        "Wind projects: %s",
+        f"{project_mapping['fuel_type'].eq('wind').sum():,}",
+    )
+    LOGGER.info(
+        "Solar projects: %s",
+        f"{project_mapping['fuel_type'].eq('solar').sum():,}",
+    )
     LOGGER.info(
         "Maximum project-to-grid distance: %.2f km",
         project_mapping["weather_distance_km"].max(),
@@ -2032,7 +1838,13 @@ def build_weather_features(
     )
 
     if not monthly_outputs:
-        save_supporting_outputs(project_mapping, monthly_summary_df, audit_df)
+        save_tables(
+            {
+                PROJECT_MAPPING_FILE: project_mapping,
+                MONTHLY_SUMMARY_FILE: monthly_summary_df,
+                AUDIT_FILE: audit_df,
+            }
+        )
         raise RuntimeError("No monthly weather-feature outputs were created.")
 
     master = pd.concat(monthly_outputs, ignore_index=True)
@@ -2046,12 +1858,20 @@ def build_weather_features(
 
     final_audit = audit_final_weather_features(master)
     audit_df = pd.concat([audit_df, final_audit], ignore_index=True)
-    overall_pass = error_checks_pass(audit_df)
+    overall_pass = audit_passed(audit_df)
 
-    save_supporting_outputs(project_mapping, monthly_summary_df, audit_df)
+    save_tables(
+        {
+            PROJECT_MAPPING_FILE: project_mapping,
+            MONTHLY_SUMMARY_FILE: monthly_summary_df,
+            AUDIT_FILE: audit_df,
+        }
+    )
 
     if not overall_pass:
-        LOGGER.error("Renewable-weather audit failed; canonical feature outputs were not written.")
+        LOGGER.error(
+            "Renewable-weather audit failed; canonical outputs were not written."
+        )
         return {
             "dataset": "renewable_weather_features",
             "status": "audit_failed",
@@ -2064,7 +1884,17 @@ def build_weather_features(
             "processing_seconds": round(time.perf_counter() - pipeline_start, 3),
         }
 
-    save_feature_outputs(master, write_csv=write_csv)
+    write_feature_outputs(
+        master,
+        OUTPUT_PARQUET,
+        OUTPUT_CSV,
+        write_csv,
+        "renewable-weather feature",
+        manifest=expected_manifest,
+    )
+    for artifact in [PROJECT_MAPPING_FILE, MONTHLY_SUMMARY_FILE, AUDIT_FILE]:
+        write_manifest(artifact, expected_manifest)
+    provenance_file = write_manifest(OUTPUT_PARQUET, expected_manifest)
 
     return {
         "dataset": "renewable_weather_features",
@@ -2077,12 +1907,15 @@ def build_weather_features(
         "projects": len(project_mapping),
         "wind_projects": int(project_mapping["fuel_type"].eq("wind").sum()),
         "solar_projects": int(project_mapping["fuel_type"].eq("solar").sum()),
-        "maximum_project_grid_distance_km": float(project_mapping["weather_distance_km"].max()),
+        "maximum_project_grid_distance_km": float(
+            project_mapping["weather_distance_km"].max()
+        ),
         "output_file": str(OUTPUT_PARQUET),
         "output_csv": str(OUTPUT_CSV) if write_csv else None,
         "project_mapping_file": str(PROJECT_MAPPING_FILE),
         "monthly_summary_file": str(MONTHLY_SUMMARY_FILE),
         "audit_file": str(AUDIT_FILE),
+        "manifest_file": str(provenance_file),
         "processing_seconds": round(time.perf_counter() - pipeline_start, 3),
     }
 
@@ -2105,6 +1938,7 @@ def print_result(result: dict[str, Any]) -> None:
 # ============================================================================
 
 def main() -> None:
+    """Run the renewable-weather pipeline from the command line."""
     parser = argparse.ArgumentParser(
         description=(
             "Build capacity-weighted renewable weather features "

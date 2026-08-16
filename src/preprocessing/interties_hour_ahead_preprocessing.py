@@ -24,29 +24,46 @@ PIPELINE OVERVIEW:
 ================================================================================
 """
 
-# Imports
 from pathlib import Path
 import argparse
-import pandas as pd
+from functools import partial
+import sys
 import time
 
+import pandas as pd
 
-# Path objects represent filesystem locations, and the / operator appends
-# folders or filenames without manually constructing platform-specific strings.
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
+from config import (
+    INTERTIES_HOUR_AHEAD_CSV,
+    INTERTIES_HOUR_AHEAD_PARQUET,
+    PROJECT_ROOT,
+    RAW_DIR,
+    PREPROCESSING_AUDITS_DIR as AUDIT_DIR,
+)
+from preprocessing.shared import (
+    DuplicateConflictError,
+    add_check,
+    add_duplicate_checks,
+    audit_passes,
+    build_manifest,
+    deduplicate_or_raise,
+    duplicate_failure_audit,
+    outputs_are_current,
+    preprocessing_code_paths,
+    set_duplicate_stats,
+    write_audit_artifacts,
+    write_tabular_outputs,
+)
 
 RAW_INTERTIE_FILES = [
     RAW_DIR / "Hourly_Metered_Volumes_and_Pool_Price_and_AIL_2010-2019.csv",
     RAW_DIR / "Hourly_Metered_Volumes_and_Pool_Price_and_AIL_2020-Jul2025.csv",
 ]
 
-PREPROCESSING_DIR = PROJECT_ROOT / "data" / "preprocessing"
-AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
-
-OUTPUT_CSV = PREPROCESSING_DIR / "interties_hour_ahead.csv"
-OUTPUT_PARQUET = PREPROCESSING_DIR / "interties_hour_ahead.parquet"
+OUTPUT_CSV = INTERTIES_HOUR_AHEAD_CSV
+OUTPUT_PARQUET = INTERTIES_HOUR_AHEAD_PARQUET
 
 AUDIT_FILE = AUDIT_DIR / "interties_audit_checks.csv"
 SUMMARY_FILE = AUDIT_DIR / "interties_feature_summary.csv"
@@ -114,8 +131,6 @@ def load_raw_intertie_file(
         single validated way to load each historical source table before
         the files are standardized and combined.
     """
-    # Raise an error if the raw source file is missing, 
-    # pipeline cannot execute otherwise. 
     if not raw_file.exists():
         raise FileNotFoundError(f"Missing raw intertie file: {raw_file}")
 
@@ -138,44 +153,31 @@ def clean_one_intertie_file(
         concatenate files from different time periods.
     """
 
-    # Create copy of raw file, 
-    # work is done on the copy. 
     raw = raw.copy()
 
-    # Strip whitespace, handle \ufeff formatting for the raw column names. 
     raw.columns = (
         raw.columns
         .str.strip()
         .str.replace("\ufeff", "", regex=False)
     )
 
-    # Create set of required columns. 
     required_raw_columns = {"Date_Begin_GMT"} | set(RAW_COLUMN_MAP.keys())
 
-    # Calculate and print - if any - missing columns. 
-    # Missing columns are calculated using the set of the columns in the copy of the raw dataset. 
     missing = required_raw_columns - set(raw.columns)
     if missing:
         raise ValueError(f"Missing raw columns in {source_file.name}: {missing}")
 
-    # Create new pandas dataframe. 
     out = pd.DataFrame()
 
-    # Create timestamp column - a datetime object version of the source
-    # files Date_Begin_GMT column. 
     out["timestamp_utc"] = pd.to_datetime(
         raw["Date_Begin_GMT"],
         errors="coerce",
         utc=True,
     )
 
-    # Loop through the key: value pairs from the RAW_COLUMN_MAP dictionary, 
-    # create columns using the clean_col naming convention, and assign values 
-    # from the copy of the source file. 
     for raw_col, clean_col in RAW_COLUMN_MAP.items():
         out[clean_col] = pd.to_numeric(raw[raw_col], errors="coerce")
 
-    # Record which source file each row came from. 
     out["source_file"] = source_file.name
 
     return out
@@ -285,22 +287,12 @@ def clean_interties(
         .reset_index(drop=True)
     )
 
-    duplicate_count = int(
-        out["timestamp_utc"]
-        .duplicated()
-        .sum()
+    out, exact_duplicate_rows = deduplicate_or_raise(
+        out,
+        ["timestamp_utc"],
+        ignore_columns=["source_file"],
+        dataset_name="interties hour ahead",
     )
-
-    if duplicate_count > 0:
-        out = (
-            out
-            .drop_duplicates(
-                subset=["timestamp_utc"],
-                keep="last",
-            )
-            .sort_values("timestamp_utc")
-            .reset_index(drop=True)
-        )
 
     out = out.drop(
         columns=["source_file"]
@@ -311,13 +303,15 @@ def clean_interties(
         ~out.columns.duplicated(),
     ]
 
-    # Clean signed directional values before audit and persistence.
     out = clean_signed_intertie_flows(
         out,
         preserve_raw=True,
     )
 
-    return out
+    return set_duplicate_stats(
+        out,
+        exact_duplicate_rows=exact_duplicate_rows,
+    )
 
 
 def audit_interties(
@@ -338,35 +332,8 @@ def audit_interties(
         write the cleaned dataset as an approved preprocessing product.
     """
     rows = []
-
-    
-    def add(
-        check,
-        passed,
-        observed=None,
-        expected=None,
-        severity="error",
-        notes="",
-    ):
-        """
-        General purpose:
-            Append one standardized audit result to the shared `rows` list,
-            recording the check name, result, severity, observed value,
-            expected value, and explanatory notes.
-
-        Role in the pipeline:
-            This local helper keeps every validation result in the same
-            structure so the enclosing function can assemble one consistent
-            audit DataFrame at the end.
-        """
-        rows.append({
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        })
+    add = partial(add_check, rows)
+    add_duplicate_checks(rows, df)
 
     add(
         "timestamp_column_exists",
@@ -387,7 +354,7 @@ def audit_interties(
     expected_index = pd.date_range(observed_start, observed_end, freq="h", tz="UTC")
     expected_hours = len(expected_index)
 
-    
+
     add("row_count_positive", len(df) > 0, len(df), "> 0")
     add("observed_period_start", True, str(observed_start), "recorded")
     add("observed_period_end", True, str(observed_end), "recorded")
@@ -407,7 +374,7 @@ def audit_interties(
         add("missing_hours", len(missing_hours) == 0, len(missing_hours), 0)
         add("extra_hours", len(extra_hours) == 0, len(extra_hours), 0)
 
-    
+
     actual_cols = set(df.columns)
     missing_cols = EXPECTED_COLUMNS - actual_cols
     extra_cols = actual_cols - EXPECTED_COLUMNS
@@ -474,7 +441,7 @@ def audit_interties(
         ),
     )
 
-    
+
     for col, (low, high) in RANGE_EXPECTATIONS.items():
         if col in df.columns:
             col_min = df[col].min(skipna=True)
@@ -488,7 +455,7 @@ def audit_interties(
                 severity="warning",
             )
 
-    
+
     for column in DIRECTIONAL_COLUMNS:
         if column not in df.columns:
             continue
@@ -587,7 +554,7 @@ def audit_interties(
         add("domain_hour_ahead_forecast_500_plus", True, spike_500, "recorded", severity="info")
         add("domain_hour_ahead_forecast_900_plus", True, spike_900, "recorded", severity="info")
 
-    
+
     summary = df[feature_cols].describe(percentiles=[0.01, 0.25, 0.5, 0.75, 0.99]).T.reset_index()
 
     summary = summary.rename(columns={
@@ -602,7 +569,7 @@ def audit_interties(
     summary["dtype"] = [str(df[c].dtype) for c in feature_cols]
 
     audit_df = pd.DataFrame(rows)
-    audit_pass = audit_df.loc[audit_df["severity"].eq("error"), "pass"].all()
+    audit_pass = audit_passes(audit_df)
 
     return audit_df, summary, bool(audit_pass)
 
@@ -623,18 +590,12 @@ def print_audit_report(
         audit_interties() for manual review.
     """
 
-    # Recalculate audit result based only on audits with an error-level severity. 
-    # Warnings and informational checks are ignored here. 
-    audit_pass = audit_df.loc[audit_df["severity"] == "error", "pass"].all()
-    # Select every failed audit check, regardless of severity level. 
+    audit_pass = audit_passes(audit_df)
     failed = audit_df.loc[~audit_df["pass"]]
 
-    # Convert the cleaned timestamp datetime object into a DatetimeIndex for time-range and coverage calculations. 
-    # The expected hours are calculated by the length of the number of hours between the minimum and maximum. 
     ts = pd.DatetimeIndex(pd.to_datetime(clean["timestamp_utc"], utc=True))
     expected_hours = len(pd.date_range(ts.min(), ts.max(), freq="h", tz="UTC"))
 
-    # Formating. 
     print("\n" + "=" * 80)
     print("INTERTIES / HOUR-AHEAD AUDIT")
     print("=" * 80)
@@ -647,19 +608,16 @@ def print_audit_report(
     print(f"Expected hrs  : {expected_hours:,}")
     print(f"Coverage      : {len(clean) / expected_hours:.2%}")
 
-    # Print out a structured message if any of the audit checks fail. 
     print("\nFailed checks:")
     if failed.empty:
         print("  None")
     else:
-        # The underscore ignored the DataFrame row index returned by iterrows().
         for _, row in failed.iterrows():
             print(
                 f"  - {row['check']} [{row['severity']}] "
                 f"observed={row['observed']} expected={row['expected']}"
             )
 
-    # Print out a structured message of the passed/failed attempts
     print("\nAudit checklist:")
     for _, row in audit_df.iterrows():
         icon = "✓" if row["pass"] else "✗"
@@ -667,7 +625,6 @@ def print_audit_report(
         check = row["check"]
         print(f"  {icon} {check} ({sev})")
 
-    # Build a smaller feature-summary table for terminal display. 
     print("\nFeature statistics:")
     compact = feature_summary[
         ["feature", "missing_count", "mean", "median", "p01", "p99", "min", "max"]
@@ -675,9 +632,6 @@ def print_audit_report(
 
     compact = compact.rename(columns={"missing_count": "missing"})
 
-    # Round selected numeric statistics to two decimal places
-    # for easier terminal reading. 
-    # This modified only the compact copy, not the feature_summary. 
     for col in ["mean", "median", "p01", "p99", "min", "max"]:
         compact[col] = compact[col].round(2)
 
@@ -702,7 +656,16 @@ def process_interties(
     """
     start_time = time.perf_counter()
 
-    if OUTPUT_CSV.exists() and OUTPUT_PARQUET.exists() and not overwrite:
+    expected_manifest = build_manifest(
+        dataset="interties_hour_ahead",
+        source_paths=RAW_INTERTIE_FILES,
+        code_paths=preprocessing_code_paths(Path(__file__)),
+    )
+
+    if not overwrite and outputs_are_current(
+        [OUTPUT_CSV, OUTPUT_PARQUET, AUDIT_FILE, SUMMARY_FILE],
+        expected_manifest,
+    ):
         return {
             "dataset": "interties_hour_ahead",
             "status": "skipped_existing",
@@ -716,9 +679,9 @@ def process_interties(
         audit_df, summary_df, audit_pass = audit_interties(clean)
         print_audit_report(audit_df, summary_df, clean)
 
-        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-        audit_df.to_csv(AUDIT_FILE, index=False)
-        summary_df.to_csv(SUMMARY_FILE, index=False)
+        write_audit_artifacts(
+            {AUDIT_FILE: audit_df, SUMMARY_FILE: summary_df}
+        )
 
         if not audit_pass:
             return {
@@ -730,10 +693,13 @@ def process_interties(
                 "processing_seconds": round(time.perf_counter() - start_time, 3),
             }
 
-        PREPROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-
-        clean.to_csv(OUTPUT_CSV, index=False)
-        clean.to_parquet(OUTPUT_PARQUET, index=False)
+        write_tabular_outputs(
+            clean,
+            parquet_path=OUTPUT_PARQUET,
+            csv_path=OUTPUT_CSV,
+            manifest=expected_manifest,
+            provenance_artifacts=[AUDIT_FILE, SUMMARY_FILE],
+        )
 
         return {
             "dataset": "interties_hour_ahead",
@@ -749,6 +715,17 @@ def process_interties(
             "parquet_file": str(OUTPUT_PARQUET),
             "audit_file": str(AUDIT_FILE),
             "summary_file": str(SUMMARY_FILE),
+            "processing_seconds": round(time.perf_counter() - start_time, 3),
+        }
+
+    except DuplicateConflictError as exc:
+        write_audit_artifacts({AUDIT_FILE: duplicate_failure_audit(exc)})
+        return {
+            "dataset": "interties_hour_ahead",
+            "status": "audit_failed",
+            "pass": False,
+            "error": str(exc),
+            "audit_file": str(AUDIT_FILE),
             "processing_seconds": round(time.perf_counter() - start_time, 3),
         }
 
@@ -789,8 +766,5 @@ def main() -> None:
     print("=" * 80)
 
 
-# Python assigns __name__ the value "__main__" when this file is executed
-# directly. When the file is imported, __name__ contains the module name,
-# which prevents main() from running automatically during the import.
 if __name__ == "__main__":
     main()

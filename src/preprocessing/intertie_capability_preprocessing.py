@@ -25,22 +25,40 @@ PIPELINE OVERVIEW:
 
 from pathlib import Path
 import argparse
-import pandas as pd
+from functools import partial
+import sys
 import time
 
+import pandas as pd
 
-# Path objects represent filesystem locations, and the / operator appends
-# folders or filenames without manually constructing path strings.
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from config import (
+    INTERTIE_CAPABILITY_CSV,
+    INTERTIE_CAPABILITY_PARQUET,
+    PROJECT_ROOT,
+    PREPROCESSING_AUDITS_DIR,
+)
+from preprocessing.shared import (
+    DuplicateConflictError,
+    add_check,
+    add_duplicate_checks,
+    audit_passes,
+    build_manifest,
+    deduplicate_or_raise,
+    duplicate_failure_audit,
+    outputs_are_current,
+    preprocessing_code_paths,
+    set_duplicate_stats,
+    write_audit_artifacts,
+    write_tabular_outputs,
+)
 
 RAW_INTERTIE_FILE = PROJECT_ROOT / "data" / "raw" / "Intertie Table.csv"
-
-PREPROCESSING_DIR = PROJECT_ROOT / "data" / "preprocessing"
-AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
-
-OUTPUT_CSV = PREPROCESSING_DIR / "intertie_capability.csv"
-OUTPUT_PARQUET = PREPROCESSING_DIR / "intertie_capability.parquet"
-
+OUTPUT_CSV = INTERTIE_CAPABILITY_CSV
+OUTPUT_PARQUET = INTERTIE_CAPABILITY_PARQUET
+AUDIT_DIR = PREPROCESSING_AUDITS_DIR
 AUDIT_FILE = AUDIT_DIR / "intertie_capability_audit_checks.csv"
 SUMMARY_FILE = AUDIT_DIR / "intertie_capability_feature_summary.csv"
 
@@ -68,7 +86,7 @@ RAW_COLUMN_MAP = {
 }
 
 RANGE_EXPECTATIONS = {
-    
+
     "atc_sk_export": (-2000, 0),
     "atc_sk_import": (0, 2000),
     "atc_wecc_export": (-3000, 0),
@@ -179,15 +197,19 @@ def clean_intertie_capability(
             errors="coerce",
     )
 
-    out = (
-        out
-        .dropna(subset=["timestamp_utc"])
-        .drop_duplicates(subset=["timestamp_utc"], keep="last")
-        .sort_values("timestamp_utc")
-        .reset_index(drop=True)
+    out = out.dropna(subset=["timestamp_utc"])
+    out, exact_duplicate_rows = deduplicate_or_raise(
+        out,
+        ["timestamp_utc"],
+        dataset_name="intertie capability",
     )
+    out = out.sort_values("timestamp_utc").reset_index(drop=True)
 
-    return out.loc[:, ~out.columns.duplicated()]
+    out = out.loc[:, ~out.columns.duplicated()]
+    return set_duplicate_stats(
+        out,
+        exact_duplicate_rows=exact_duplicate_rows,
+    )
 
 
 def audit_intertie_capability(
@@ -209,35 +231,8 @@ def audit_intertie_capability(
         may write the cleaned dataset as an approved preprocessing product.
     """
     rows = []
-
-    
-    def add(
-        check,
-        passed,
-        observed=None,
-        expected=None,
-        severity="error",
-        notes="",
-    ):
-        """
-        General purpose:
-            Append one standardized audit result to the shared `rows` list,
-            recording the check name, result, severity, observed value,
-            expected value, and any explanatory notes.
-
-        Role in the pipeline:
-            This local helper keeps every audit result in the same dictionary
-            structure so the enclosing function can assemble one consistent
-            audit DataFrame at the end.
-        """
-        rows.append({
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        })
+    add = partial(add_check, rows)
+    add_duplicate_checks(rows, df)
 
     add(
         "timestamp_column_exists",
@@ -381,7 +376,7 @@ def audit_intertie_capability(
         if {atc_col, ttc_col}.issubset(df.columns):
 
             if direction == "export":
-                
+
                 valid_mask = df[[atc_col, ttc_col]].notna().all(axis=1)
                 violations = int((df.loc[valid_mask, atc_col].abs() > df.loc[valid_mask, ttc_col].abs()).sum())
 
@@ -421,7 +416,7 @@ def audit_intertie_capability(
     summary["dtype"] = [str(df[c].dtype) for c in feature_cols]
 
     audit_df = pd.DataFrame(rows)
-    audit_pass = audit_df.loc[audit_df["severity"].eq("error"), "pass"].all()
+    audit_pass = audit_passes(audit_df)
 
     return audit_df, summary, bool(audit_pass)
 
@@ -441,7 +436,7 @@ def print_audit_report(
         pass/fail result; it exposes the findings from
         audit_intertie_capability() for manual review.
     """
-    audit_pass = audit_df.loc[audit_df["severity"] == "error", "pass"].all()
+    audit_pass = audit_passes(audit_df)
     failed = audit_df.loc[~audit_df["pass"]]
 
     ts = pd.DatetimeIndex(pd.to_datetime(clean["timestamp_utc"], utc=True))
@@ -507,7 +502,16 @@ def process_intertie_capability(
     """
     start_time = time.perf_counter()
 
-    if OUTPUT_CSV.exists() and OUTPUT_PARQUET.exists() and not overwrite:
+    expected_manifest = build_manifest(
+        dataset="intertie_capability",
+        source_paths=[RAW_INTERTIE_FILE],
+        code_paths=preprocessing_code_paths(Path(__file__)),
+    )
+
+    if not overwrite and outputs_are_current(
+        [OUTPUT_CSV, OUTPUT_PARQUET, AUDIT_FILE, SUMMARY_FILE],
+        expected_manifest,
+    ):
         return {
             "dataset": "intertie_capability",
             "status": "skipped_existing",
@@ -522,9 +526,9 @@ def process_intertie_capability(
         audit_df, summary_df, audit_pass = audit_intertie_capability(clean)
         print_audit_report(audit_df, summary_df, clean)
 
-        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-        audit_df.to_csv(AUDIT_FILE, index=False)
-        summary_df.to_csv(SUMMARY_FILE, index=False)
+        write_audit_artifacts(
+            {AUDIT_FILE: audit_df, SUMMARY_FILE: summary_df}
+        )
 
         if not audit_pass:
             return {
@@ -536,10 +540,13 @@ def process_intertie_capability(
                 "processing_seconds": round(time.perf_counter() - start_time, 3),
             }
 
-        PREPROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-
-        clean.to_csv(OUTPUT_CSV, index=False)
-        clean.to_parquet(OUTPUT_PARQUET, index=False)
+        write_tabular_outputs(
+            clean,
+            parquet_path=OUTPUT_PARQUET,
+            csv_path=OUTPUT_CSV,
+            manifest=expected_manifest,
+            provenance_artifacts=[AUDIT_FILE, SUMMARY_FILE],
+        )
 
         return {
             "dataset": "intertie_capability",
@@ -555,6 +562,17 @@ def process_intertie_capability(
             "parquet_file": str(OUTPUT_PARQUET),
             "audit_file": str(AUDIT_FILE),
             "summary_file": str(SUMMARY_FILE),
+            "processing_seconds": round(time.perf_counter() - start_time, 3),
+        }
+
+    except DuplicateConflictError as exc:
+        write_audit_artifacts({AUDIT_FILE: duplicate_failure_audit(exc)})
+        return {
+            "dataset": "intertie_capability",
+            "status": "audit_failed",
+            "pass": False,
+            "error": str(exc),
+            "audit_file": str(AUDIT_FILE),
             "processing_seconds": round(time.perf_counter() - start_time, 3),
         }
 
@@ -595,8 +613,5 @@ def main() -> None:
     print("=" * 80)
 
 
-# Python assigns __name__ the value "__main__" when this file is executed
-# directly. When the file is imported, __name__ contains the module name,
-# which prevents main() from running automatically during the import.
 if __name__ == "__main__":
     main()

@@ -47,17 +47,17 @@ Outputs
 -------
 Canonical feature output:
 
-    data/features/calendar/calendar_features_hourly.parquet
+    data/processed/feature_engineering/calendar/calendar_features_hourly.parquet
 
 Optional full CSV output:
 
-    data/features/calendar/calendar_features_hourly.csv
+    data/processed/feature_engineering/calendar/calendar_features_hourly.csv
 
 Audit outputs:
 
-    data/audits/calendar_features_audit_checks.csv
-    data/audits/calendar_features_summary.csv
-    data/audits/calendar_holiday_dates.csv
+    data/audits/feature_engineering/calendar_features_audit_checks.csv
+    data/audits/feature_engineering/calendar_features_summary.csv
+    data/audits/feature_engineering/calendar_holiday_dates.csv
 
 Run
 ---
@@ -105,6 +105,37 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .shared import (
+        add_check,
+        build_manifest,
+        configure_logging,
+        ensure_directories,
+        feature_code_paths,
+        ensure_src_on_path,
+        existing_outputs_satisfy_request as outputs_satisfy_request,
+        output_is_current,
+        save_feature_outputs as write_feature_outputs,
+        save_tables,
+        write_manifest,
+    )
+except ImportError:  # Support direct execution of this file.
+    from shared import (
+        add_check,
+        build_manifest,
+        configure_logging,
+        ensure_directories,
+        feature_code_paths,
+        ensure_src_on_path,
+        existing_outputs_satisfy_request as outputs_satisfy_request,
+        output_is_current,
+        save_feature_outputs as write_feature_outputs,
+        save_tables,
+        write_manifest,
+    )
+
+ensure_src_on_path(__file__)
+
+try:
     import holidays
 except ImportError as exc:
     raise ImportError(
@@ -119,49 +150,56 @@ except ImportError as exc:
 
 LOGGER = logging.getLogger(__name__)
 
-
-def configure_logging(verbose: bool = False) -> None:
-    """
-    Configure console logging for the pipeline.
-
-    INFO is used by default.
-
-    DEBUG can be enabled with the command-line --verbose flag.
-    """
-
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-
-
 # ============================================================================
 # Project paths
 # ============================================================================
 
-# This file is expected to live at:
-#
-#     PROJECT_ROOT/src/feature_engineering/calendar_features.py
-#
-# parents[0] -> feature_engineering
-# parents[1] -> src
-# parents[2] -> project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from config import (
+    FEATURES_DIR,
+    FEATURE_ENGINEERING_AUDITS_DIR,
+    PIPELINE_END_UTC,
+    PIPELINE_START_UTC,
+    PROJECT_ROOT,
+)
 
-FEATURES_DIR = PROJECT_ROOT / "data" / "features"
-OUTPUT_DIR = FEATURES_DIR / "calendar"
 
-OUTPUT_PARQUET = OUTPUT_DIR / "calendar_features_hourly.parquet"
-OUTPUT_CSV = OUTPUT_DIR / "calendar_features_hourly.csv"
+OUTPUT_DIR = (
+    FEATURES_DIR
+    / "calendar"
+)
 
-AUDIT_DIR = PROJECT_ROOT / "data" / "audits"
 
-AUDIT_FILE = AUDIT_DIR / "calendar_features_audit_checks.csv"
-SUMMARY_FILE = AUDIT_DIR / "calendar_features_summary.csv"
-HOLIDAY_DATES_FILE = AUDIT_DIR / "calendar_holiday_dates.csv"
+AUDIT_DIR = FEATURE_ENGINEERING_AUDITS_DIR
 
+
+OUTPUT_PARQUET = (
+    OUTPUT_DIR
+    / "calendar_features_hourly.parquet"
+)
+
+
+OUTPUT_CSV = (
+    OUTPUT_DIR
+    / "calendar_features_hourly.csv"
+)
+
+
+AUDIT_FILE = (
+    AUDIT_DIR
+    / "calendar_features_audit_checks.csv"
+)
+
+
+SUMMARY_FILE = (
+    AUDIT_DIR
+    / "calendar_features_summary.csv"
+)
+
+
+HOLIDAY_DATES_FILE = (
+    AUDIT_DIR
+    / "calendar_holiday_dates.csv"
+)
 
 # ============================================================================
 # Configuration
@@ -169,10 +207,11 @@ HOLIDAY_DATES_FILE = AUDIT_DIR / "calendar_holiday_dates.csv"
 
 TIMEZONE = "America/Edmonton"
 
-DEFAULT_START_UTC = "2015-01-01 00:00:00+00:00"
-DEFAULT_END_UTC = "2026-06-30 23:00:00+00:00"
+DEFAULT_START_UTC = PIPELINE_START_UTC
+DEFAULT_END_UTC = PIPELINE_END_UTC
 
 DATASET_NAME = "calendar_features"
+FEATURE_INFORMATION_POLICY = "known_ahead"
 
 VALID_SEASONS = {
     "winter",
@@ -269,43 +308,6 @@ REQUIRED_COLUMNS = [
 # ============================================================================
 # General helpers
 # ============================================================================
-
-def ensure_output_directories() -> None:
-    """Create feature and audit output directories if they do not exist."""
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    AUDIT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-def add_check(
-    rows: list[dict[str, Any]],
-    check: str,
-    passed: bool,
-    observed: Any = None,
-    expected: Any = None,
-    severity: str = "error",
-    notes: str = "",
-) -> None:
-    """Append one audit check."""
-
-    rows.append(
-        {
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        }
-    )
-
 
 def parse_utc_timestamp(
     value: str | pd.Timestamp,
@@ -905,22 +907,6 @@ def build_calendar_features(
     # Cyclical encodings
     # ------------------------------------------------------------------------
 
-    """
-    Cyclical encodings represent values that wrap around.
-
-    Mathematically, hours 23:00 and 00:00 differ by 23 when represented as
-    ordinary integers, but in reality they are only one hour apart. Placing
-    hours around a circle allows 23:00 and 00:00 to sit next to each other,
-    similar to their positions on a clock.
-
-    The same concept can be applied to hours, weekdays, months, and days
-    of the year.
-
-    In power forecasting, electricity demand follows repeated cycles. This
-    is also why some lagged features may be more predictive at t-24 hours
-    than at t-18 hours.
-    """
-
     two_pi = 2.0 * np.pi
 
     calendar["hour_sin"] = np.sin(
@@ -965,15 +951,21 @@ def build_calendar_features(
         / 12.0
     )
 
-    # A denominator of 366 preserves a consistent feature definition across
-    # leap and non-leap years.
+    # Use each local year's true length so Dec. 31 and Jan. 1 remain one
+    # encoded day apart in both leap and non-leap years.
+    days_in_year = np.where(
+        timestamp_local.dt.is_leap_year,
+        366.0,
+        365.0,
+    )
+
     calendar["day_of_year_sin"] = np.sin(
         two_pi
         * (
             calendar["day_of_year_alberta"]
             - 1
         )
-        / 366.0
+        / days_in_year
     )
 
     calendar["day_of_year_cos"] = np.cos(
@@ -982,7 +974,7 @@ def build_calendar_features(
             calendar["day_of_year_alberta"]
             - 1
         )
-        / 366.0
+        / days_in_year
     )
 
     LOGGER.info(
@@ -1820,101 +1812,6 @@ def print_pipeline_result(
 # Output helpers
 # ============================================================================
 
-def save_audit_outputs(
-    audit: pd.DataFrame,
-    summary: pd.DataFrame,
-    holiday_table: pd.DataFrame,
-) -> None:
-    """Write calendar audit and metadata tables."""
-
-    ensure_output_directories()
-
-    LOGGER.info(
-        "Writing audit checks to %s.",
-        AUDIT_FILE,
-    )
-
-    audit.to_csv(
-        AUDIT_FILE,
-        index=False,
-    )
-
-    LOGGER.info(
-        "Writing numeric summary to %s.",
-        SUMMARY_FILE,
-    )
-
-    summary.to_csv(
-        SUMMARY_FILE,
-        index=False,
-    )
-
-    LOGGER.info(
-        "Writing holiday-date table to %s.",
-        HOLIDAY_DATES_FILE,
-    )
-
-    holiday_table.to_csv(
-        HOLIDAY_DATES_FILE,
-        index=False,
-    )
-
-
-def save_feature_outputs(
-    calendar: pd.DataFrame,
-    write_csv: bool,
-) -> None:
-    """Write canonical Parquet and optional CSV feature outputs."""
-
-    ensure_output_directories()
-
-    LOGGER.info(
-        "Writing canonical calendar Parquet to %s.",
-        OUTPUT_PARQUET,
-    )
-
-    calendar.to_parquet(
-        OUTPUT_PARQUET,
-        index=False,
-    )
-
-    if write_csv:
-        LOGGER.info(
-            "Writing optional calendar CSV to %s.",
-            OUTPUT_CSV,
-        )
-
-        calendar.to_csv(
-            OUTPUT_CSV,
-            index=False,
-        )
-
-
-def existing_outputs_satisfy_request(
-    write_csv: bool,
-) -> bool:
-    """
-    Return True when all requested feature outputs already exist.
-
-    Parquet is always required.
-
-    CSV is required only when write_csv=True.
-    """
-
-    parquet_exists = OUTPUT_PARQUET.exists()
-
-    csv_requirement_satisfied = (
-        OUTPUT_CSV.exists()
-        if write_csv
-        else True
-    )
-
-    return (
-        parquet_exists
-        and csv_requirement_satisfied
-    )
-
-
 def read_existing_parquet_for_csv() -> pd.DataFrame:
     """
     Load an existing canonical Parquet file when only a missing CSV is needed.
@@ -1997,7 +1894,18 @@ def process_calendar_features(
         f"{expected_hour_count(start_utc, end_utc):,}",
     )
 
-    ensure_output_directories()
+    ensure_directories(OUTPUT_DIR, AUDIT_DIR)
+    expected_manifest = build_manifest(
+        dataset=DATASET_NAME,
+        source_paths=[],
+        code_paths=feature_code_paths(Path(__file__)),
+        configuration={
+            "feature_information_policy": FEATURE_INFORMATION_POLICY,
+            "start_utc": str(start_utc),
+            "end_utc": str(end_utc),
+            "timezone": TIMEZONE,
+        },
+    )
 
     # ------------------------------------------------------------------------
     # Existing-output handling
@@ -2010,8 +1918,12 @@ def process_calendar_features(
     # the Parquet was produced during an earlier run.
     if (
         not overwrite
-        and existing_outputs_satisfy_request(
-            write_csv=write_csv
+        and outputs_satisfy_request(
+            OUTPUT_PARQUET,
+            OUTPUT_CSV,
+            write_csv=write_csv,
+            expected_manifest=expected_manifest,
+            required_artifacts=[AUDIT_FILE, SUMMARY_FILE, HOLIDAY_DATES_FILE],
         )
     ):
         LOGGER.info(
@@ -2062,7 +1974,7 @@ def process_calendar_features(
     # pipeline that originally created it.
     if (
         not overwrite
-        and OUTPUT_PARQUET.exists()
+        and output_is_current(OUTPUT_PARQUET, expected_manifest)
         and write_csv
         and not OUTPUT_CSV.exists()
     ):
@@ -2076,6 +1988,7 @@ def process_calendar_features(
             OUTPUT_CSV,
             index=False,
         )
+        write_manifest(OUTPUT_CSV, expected_manifest)
 
         return {
             "dataset": DATASET_NAME,
@@ -2146,10 +2059,17 @@ def process_calendar_features(
     # Audit outputs are written regardless of whether the audit passes.
     #
     # This preserves the evidence needed to diagnose a failed pipeline run.
-    save_audit_outputs(
-        audit,
-        summary,
-        holiday_table,
+    save_tables(
+        {
+            AUDIT_FILE: audit,
+            SUMMARY_FILE: summary,
+            HOLIDAY_DATES_FILE: holiday_table,
+        },
+        {
+            AUDIT_FILE: "calendar audit checks",
+            SUMMARY_FILE: "calendar numeric summary",
+            HOLIDAY_DATES_FILE: "calendar holiday-date table",
+        },
     )
 
     if not audit_pass:
@@ -2182,10 +2102,17 @@ def process_calendar_features(
     # Feature output
     # ------------------------------------------------------------------------
 
-    save_feature_outputs(
+    write_feature_outputs(
         calendar,
-        write_csv=write_csv,
+        OUTPUT_PARQUET,
+        OUTPUT_CSV,
+        write_csv,
+        "calendar-feature",
+        manifest=expected_manifest,
     )
+    for artifact in [AUDIT_FILE, SUMMARY_FILE, HOLIDAY_DATES_FILE]:
+        write_manifest(artifact, expected_manifest)
+    provenance_file = write_manifest(OUTPUT_PARQUET, expected_manifest)
 
     processing_seconds = round(
         time.perf_counter()
@@ -2232,6 +2159,7 @@ def process_calendar_features(
         "audit_file": str(AUDIT_FILE),
         "summary_file": str(SUMMARY_FILE),
         "holiday_dates_file": str(HOLIDAY_DATES_FILE),
+        "manifest_file": str(provenance_file),
         "processing_seconds": processing_seconds,
     }
 

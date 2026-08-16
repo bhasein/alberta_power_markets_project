@@ -27,71 +27,56 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import sys
 import time
 
 import pandas as pd
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# ============================================================================
-# Paths
-# ============================================================================
+from config import (
+    CALENDAR_FEATURES,
+    DATA_DIR,
+    GENERATION_FEATURES,
+    INTERTIE_CAPABILITY_PARQUET,
+    LOAD_WEATHER_FEATURES,
+    MARKET_FEATURES,
+    MASTER_CSV,
+    MASTER_PARQUET,
+    RENEWABLE_WEATHER_FEATURES,
+)
+from preprocessing.shared import (
+    add_check,
+    audit_passes,
+    build_manifest,
+    outputs_are_current,
+    preprocessing_code_paths,
+    write_audit_artifacts,
+    write_tabular_outputs,
+)
 
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+AUDIT_DIR = DATA_DIR / "audits" / "master"
 
-DATA_DIR = PROJECT_ROOT / "data"
-PREPROCESSING_DIR = DATA_DIR / "preprocessing"
-FEATURES_DIR = DATA_DIR / "features"
-AUDIT_DIR = DATA_DIR / "audits"
-
-MASTER_DIR = PREPROCESSING_DIR / "master"
-OUTPUT_PARQUET = MASTER_DIR / "master_hourly.parquet"
-OUTPUT_CSV = MASTER_DIR / "master_hourly.csv"
+OUTPUT_PARQUET = MASTER_PARQUET
+OUTPUT_CSV = MASTER_CSV
 
 AUDIT_FILE = AUDIT_DIR / "master_audit_checks.csv"
 FEATURE_SUMMARY_FILE = AUDIT_DIR / "master_feature_summary.csv"
 SOURCE_SUMMARY_FILE = AUDIT_DIR / "master_source_summary.csv"
 RECONCILED_COLUMNS_FILE = AUDIT_DIR / "master_reconciled_columns.csv"
 
+
 SOURCE_FILES = {
-    "calendar": FEATURES_DIR / "calendar" / "calendar_features_hourly.parquet",
-    "market": FEATURES_DIR / "market" / "market_features_hourly.parquet",
-    "intertie_capability": (
-        PREPROCESSING_DIR / "intertie_capability_preprocessed.parquet"
-    ),
-    "generation": PREPROCESSING_DIR / "generation_by_fuel_preprocessed.parquet",
-    "load_weather": FEATURES_DIR / "weather" / "load_weather_features_hourly.parquet",
-    "renewable_weather": (
-        FEATURES_DIR / "weather" / "renewable_weather_features_hourly.parquet"
-    ),
+    "calendar": CALENDAR_FEATURES,
+    "market": MARKET_FEATURES,
+    "intertie_capability": INTERTIE_CAPABILITY_PARQUET,
+    "generation": GENERATION_FEATURES,
+    "load_weather": LOAD_WEATHER_FEATURES,
+    "renewable_weather": RENEWABLE_WEATHER_FEATURES,
 }
 
 MERGE_KEY = "timestamp_utc"
-
-
-# ============================================================================
-# Audit helpers
-# ============================================================================
-
-def add_check(
-    rows: list[dict],
-    check: str,
-    passed: bool,
-    observed=None,
-    expected=None,
-    severity: str = "error",
-    notes: str = "",
-) -> None:
-    """
-    Append one standardized audit check result.
-    """
-    rows.append({
-        "check": check,
-        "pass": bool(passed),
-        "severity": severity,
-        "observed": observed,
-        "expected": expected,
-        "notes": notes,
-    })
 
 
 def values_match(
@@ -109,10 +94,6 @@ def values_match(
         )
     )
 
-
-# ============================================================================
-# Source loading
-# ============================================================================
 
 def load_source_datasets(
     source_files: dict[str, Path] = SOURCE_FILES,
@@ -171,10 +152,6 @@ def build_source_summary(
 
     return pd.DataFrame(rows)
 
-
-# ============================================================================
-# Master merge
-# ============================================================================
 
 def validate_sources(
     datasets: dict[str, pd.DataFrame],
@@ -369,10 +346,6 @@ def merge_master_sources(
     return master, reconciled, source_audit
 
 
-# ============================================================================
-# Master audit
-# ============================================================================
-
 def audit_master_dataset(
     master: pd.DataFrame,
     datasets: dict[str, pd.DataFrame],
@@ -560,16 +533,7 @@ def audit_master_dataset(
 
     audit = pd.DataFrame(rows)
 
-    error_checks = audit.loc[
-        audit["severity"].eq("error"),
-        "pass",
-    ]
-
-    audit_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    audit_pass = audit_passes(audit)
 
     return audit, audit_pass
 
@@ -643,10 +607,7 @@ def print_audit_report(
     """
     Print a concise terminal report for the master preprocessing run.
     """
-    audit_pass = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ].all()
+    audit_pass = audit_passes(audit_df)
 
     failed = audit_df.loc[
         ~audit_df["pass"]
@@ -711,10 +672,6 @@ def print_audit_report(
     print("=" * 80)
 
 
-# ============================================================================
-# Pipeline entry point
-# ============================================================================
-
 def process_master(
     overwrite: bool = False,
     write_csv: bool = False,
@@ -724,7 +681,27 @@ def process_master(
     """
     start_time = time.perf_counter()
 
-    if OUTPUT_PARQUET.exists() and not overwrite:
+    expected_manifest = build_manifest(
+        dataset="master",
+        source_paths=list(SOURCE_FILES.values()),
+        code_paths=preprocessing_code_paths(Path(__file__)),
+        configuration={"merge_key": MERGE_KEY},
+    )
+
+    audit_artifacts = [
+        AUDIT_FILE,
+        FEATURE_SUMMARY_FILE,
+        SOURCE_SUMMARY_FILE,
+        RECONCILED_COLUMNS_FILE,
+    ]
+    requested_outputs = [OUTPUT_PARQUET, *audit_artifacts]
+    if write_csv:
+        requested_outputs.append(OUTPUT_CSV)
+
+    if not overwrite and outputs_are_current(
+        requested_outputs,
+        expected_manifest,
+    ):
         return {
             "dataset": "master",
             "status": "skipped_existing",
@@ -762,29 +739,13 @@ def process_master(
             master,
         )
 
-        AUDIT_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        audit_df.to_csv(
-            AUDIT_FILE,
-            index=False,
-        )
-
-        feature_summary.to_csv(
-            FEATURE_SUMMARY_FILE,
-            index=False,
-        )
-
-        source_summary.to_csv(
-            SOURCE_SUMMARY_FILE,
-            index=False,
-        )
-
-        reconciled_columns.to_csv(
-            RECONCILED_COLUMNS_FILE,
-            index=False,
+        write_audit_artifacts(
+            {
+                AUDIT_FILE: audit_df,
+                FEATURE_SUMMARY_FILE: feature_summary,
+                SOURCE_SUMMARY_FILE: source_summary,
+                RECONCILED_COLUMNS_FILE: reconciled_columns,
+            }
         )
 
         if not audit_pass:
@@ -803,24 +764,17 @@ def process_master(
                 ),
             }
 
-        MASTER_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        master.to_parquet(
-            OUTPUT_PARQUET,
-            index=False,
-        )
-
         csv_file = "not written"
-
         if write_csv:
-            master.to_csv(
-                OUTPUT_CSV,
-                index=False,
-            )
             csv_file = str(OUTPUT_CSV)
+
+        write_tabular_outputs(
+            master,
+            parquet_path=OUTPUT_PARQUET,
+            csv_path=OUTPUT_CSV if write_csv else None,
+            manifest=expected_manifest,
+            provenance_artifacts=audit_artifacts,
+        )
 
         return {
             "dataset": "master",

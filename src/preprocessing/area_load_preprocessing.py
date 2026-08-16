@@ -13,47 +13,69 @@ WHY THIS FILE IS USEFUL:
     which source file every row came from. The result is one continuous,
     trustworthy hourly load series suitable for downstream modeling.
 
+    After the timeline is gap-filled, the series is extended forward to a
+    configured horizon by holding the most recently observed regional load
+    distribution constant. This keeps the spatial (region-share) distribution
+    frozen at its final observed state for every extended hour, rather than
+    leaving downstream consumers (e.g. load_weather_features.py) with no
+    coverage past the last raw AESO observation.
+
 PIPELINE OVERVIEW:
     raw AESO area-load files (mixed formats/timestamp layouts)
-        --> discover_raw_files()          scans the raw folder for compatible files
-        --> read_raw_file()               reads each file in its native format
-        --> clean_area_load_file()        standardizes one file's schema/timestamps
-        --> combine_area_load_files()     merges all files, resolves overlaps
-        --> fill_missing_hourly_records() completes the timeline, flags fills
-        --> audit_area_load()             validates the combined dataset
-        --> process_area_load()           orchestrates the steps, writes outputs
-        --> main()                        exposes the pipeline as a CLI script
+        --> discover_raw_files()              scans the raw folder for compatible files
+        --> read_raw_file()                   reads each file in its native format
+        --> clean_area_load_file()            standardizes one file's schema/timestamps
+        --> combine_area_load_files()         merges all files, resolves overlaps
+        --> fill_missing_hourly_records()     completes the interior timeline, flags fills
+        --> extend_with_frozen_distribution() extends the timeline forward, freezing distribution
+        --> audit_area_load()                 validates the combined dataset
+        --> process_area_load()               orchestrates the steps, writes outputs
+        --> main()                            exposes the pipeline as a CLI script
 ================================================================================
 """
 
-# Imports 
 from pathlib import Path
 import argparse
+from functools import partial
+import sys
 import time
 
 import numpy as np
 import pandas as pd
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Path to project root
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
+from config import (
+    AREA_LOAD_CSV,
+    AREA_LOAD_PARQUET,
+    PROJECT_ROOT,
+    RAW_DIR as RAW_DATA_DIR,
+    PREPROCESSING_AUDITS_DIR as AUDIT_DIR,
+)
+from preprocessing.shared import (
+    DuplicateConflictError,
+    add_check,
+    add_duplicate_checks,
+    audit_passes,
+    build_manifest,
+    deduplicate_or_raise,
+    duplicate_failure_audit,
+    outputs_are_current,
+    preprocessing_code_paths,
+    set_duplicate_stats,
+    write_audit_artifacts,
+    write_tabular_outputs,
+)
 
-# Paths to data folders
-RAW_DATA_DIR = PROJECT_ROOT / "data/raw"
-PREPROCESSING_DIR = PROJECT_ROOT / "data/preprocessing"
-AUDIT_DIR = PROJECT_ROOT / "data/audits"
+OUTPUT_CSV = AREA_LOAD_CSV
+OUTPUT_PARQUET = AREA_LOAD_PARQUET
 
-# Paths to outputs
-OUTPUT_CSV = PREPROCESSING_DIR / "area_load_preprocessed.csv"
-OUTPUT_PARQUET = PREPROCESSING_DIR / "area_load_preprocessed.parquet"
-
-# Paths to audit/summary outputs
 AUDIT_FILE = AUDIT_DIR / "area_load_audit_checks.csv"
 SUMMARY_FILE = AUDIT_DIR / "area_load_feature_summary.csv"
 FILE_SUMMARY_FILE = AUDIT_DIR / "area_load_file_summary.csv"
 
 
-# a list literal of the six AESO planning-region names as they appear in raw files.
 REGION_COLUMNS = [
     "CALGARY",
     "CENTRAL",
@@ -63,8 +85,6 @@ REGION_COLUMNS = [
     "SOUTH",
 ]
 
-# This dictionary connects each raw AESO region name to the standardized
-# snake_case column name that will be used in the cleaned dataset.
 REGION_CLEAN_MAP = {
     "CALGARY": "calgary_load_mw",
     "CENTRAL": "central_load_mw",
@@ -75,7 +95,6 @@ REGION_CLEAN_MAP = {
 }
 
 
-# a dict literal mapping each granular AESO "AREA" code (key) to its parent region (value).
 AREA_TO_REGION = {
     "AREA6": "CALGARY",
     "AREA57": "CALGARY",
@@ -125,18 +144,13 @@ AREA_TO_REGION = {
     "AREA26": "NORTHWEST",
 }
 
-# sorted(dict) returns a sorted list of a dict's keys.
 EXPECTED_AREA_COLUMNS = sorted(AREA_TO_REGION)
 
-# A dictionary comprehension creates one mapping for every expected AREA code.
-# Each raw name becomes a standardized column name such as AREA6 -> area6_load_mw.
 AREA_CLEAN_MAP = {
     area: f"{area.lower()}_load_mw"
     for area in EXPECTED_AREA_COLUMNS
 }
 
-# This list comprehension looks up each standardized AREA column name while
-# preserving the ordering established by EXPECTED_AREA_COLUMNS.
 AREA_COLUMNS_CLEAN = [
     AREA_CLEAN_MAP[area]
     for area in EXPECTED_AREA_COLUMNS
@@ -147,9 +161,6 @@ REGION_COLUMNS_CLEAN = [
     for region in REGION_COLUMNS
 ]
 
-# The starred expressions unpack all AREA and region column names into this set.
-# A set is useful here because the audit only needs to test which names are
-# present, rather than preserve their order.
 EXPECTED_OUTPUT_COLUMNS = {
     "timestamp_utc",
     *AREA_COLUMNS_CLEAN,
@@ -157,11 +168,9 @@ EXPECTED_OUTPUT_COLUMNS = {
     "total_area_load_mw",
     "total_region_load_mw",
     "area_load_imputed",
+    "area_load_frozen",
 }
 
-# The two dictionary comprehensions assign an acceptable numeric range to
-# every AREA and region column. The ** operators unpack those generated
-# mappings into one dictionary alongside the ranges for totals and flags.
 RANGE_EXPECTATIONS = {
     **{
         column: (-5000, 20000)
@@ -174,7 +183,17 @@ RANGE_EXPECTATIONS = {
     "total_area_load_mw": (-5000, 50000),
     "total_region_load_mw": (-5000, 50000),
     "area_load_imputed": (0, 1),
+    "area_load_frozen": (0, 1),
 }
+
+
+EXTEND_END_LOCAL = pd.Timestamp("2025-12-31 23:00:00")
+
+EXTEND_END_UTC = (
+    EXTEND_END_LOCAL
+    .tz_localize("Etc/GMT+7")
+    .tz_convert("UTC")
+)
 
 
 def normalize_header_value(value) -> str:
@@ -189,9 +208,6 @@ def normalize_header_value(value) -> str:
         inconsistent Excel header cells without being tripped up by case,
         stray whitespace, or hidden characters.
     """
-    # The input is intentionally left unrestricted because spreadsheet header
-    # cells may contain strings, numbers, or other values. The -> str annotation
-    # documents that the function always returns a normalized string.
     return (
         str(value)
         .strip()
@@ -217,9 +233,6 @@ def read_excel_area_load(
         workbook. It hands back a properly-headered DataFrame so the rest
         of the pipeline doesn't need to know Excel's sheet/row quirks.
     """
-    # nrows may be an integer limiting how many data rows are loaded, or None
-    # to read the complete table. This lets the same function support both
-    # lightweight file discovery and full preprocessing.
     workbook = pd.ExcelFile(path)
     required_regions = set(REGION_COLUMNS)
 
@@ -283,9 +296,6 @@ def read_raw_file(
             nrows=nrows,
         )
 
-    # Each dictionary contains one delimiter-and-encoding combination to try.
-    # Keeping the options in a list allows the same read operation to be
-    # repeated systematically until the file is parsed into multiple columns.
     attempts = [
         {"sep": ",", "encoding": "utf-8-sig"},
         {"sep": "\t", "encoding": "utf-8-sig"},
@@ -297,8 +307,6 @@ def read_raw_file(
 
     for options in attempts:
         try:
-            # **options passes the dictionary entries to pd.read_csv as named
-            # arguments, equivalent to writing sep=... and encoding=... directly.
             frame = pd.read_csv(
                 path,
                 nrows=nrows,
@@ -334,8 +342,6 @@ def discover_raw_files(
         with a complete, verified list of usable source files, so the
         pipeline doesn't depend on a hardcoded list of filenames.
     """
-    # The return annotation list[Path] documents that the result will be a
-    # collection of filesystem Path objects rather than plain filename strings.
     candidates = sorted(
         [
             *raw_dir.rglob("*.csv"),
@@ -418,9 +424,6 @@ def standardize_raw_columns(
             "",
             regex=False,
         )
-        # The regular expression r"\s+" matches any run of one or more
-        # whitespace characters. Replacing each run with one space makes
-        # headers consistent even when they contain tabs or repeated spaces.
         .str.replace(
             r"\s+",
             " ",
@@ -450,9 +453,6 @@ def parse_dt_mst(
         errors="coerce",
     )
 
-    # tz_localize assigns the fixed MST timezone to timestamps that currently
-    # have no timezone information. tz_convert then represents those same
-    # moments in UTC without changing the actual points in time.
     return (
         parsed
         .dt.tz_localize("Etc/GMT+7")
@@ -485,17 +485,11 @@ def parse_date_hour_ending(
         errors="coerce",
     )
 
-    # between(1, 24) creates a boolean mask identifying valid hour-ending
-    # values. Combining it with dates.notna() ensures both timestamp parts
-    # are usable before the code attempts to construct a complete timestamp.
     valid = (
         dates.notna()
         & hour_ending.between(1, 24)
     )
 
-    # Hour-ending values label the end of each hourly interval, so subtracting
-    # one converts them to hour-beginning offsets: HE 1 becomes 00:00,
-    # HE 2 becomes 01:00, and HE 24 becomes 23:00.
     local_hour_beginning = (
         dates
         + pd.to_timedelta(
@@ -631,9 +625,6 @@ def clean_area_load_file(
         )
     ]
 
-    # axis=1 tells pandas to sum horizontally across the selected columns
-    # for each row. min_count=1 preserves NaN only when every selected AREA
-    # value in that row is missing, rather than incorrectly returning zero.
     out["total_area_load_mw"] = (
         out[observed_area_columns]
         .sum(
@@ -682,8 +673,6 @@ def combine_area_load_files(
         discover_raw_files() and produces the single unified (but not yet
         gap-filled) dataset that fill_missing_hourly_records() will refine.
     """
-    # The return annotation documents that this function produces exactly
-    # two DataFrames: the combined hourly dataset and a per-file summary table.
     cleaned_frames = []
     file_summaries = []
 
@@ -749,67 +738,13 @@ def combine_area_load_files(
         ignore_index=True,
     )
 
-    # keep=False marks every row involved in a duplicated timestamp, including
-    # the first occurrence. This makes it possible to compare all competing
-    # records rather than seeing only the later duplicates.
-    duplicate_rows = combined.loc[
-        combined["timestamp_utc"].duplicated(
-            keep=False
-        )
-    ].copy()
-
-    if not duplicate_rows.empty:
-        compare_columns = [
-            *AREA_COLUMNS_CLEAN,
-            *REGION_COLUMNS_CLEAN,
-            "total_area_load_mw",
-            "total_region_load_mw",
-        ]
-
-        conflicting_timestamps = []
-
-        for (
-            timestamp,
-            group,
-        ) in duplicate_rows.groupby(
-            "timestamp_utc"
-        ):
-            # nunique counts the distinct values in each comparison column.
-            # Including missing values means NaN versus a recorded value is
-            # treated as a disagreement. Taking max() asks whether any column
-            # contains more than one distinct value within this timestamp group.
-            if (
-                group[compare_columns]
-                .nunique(
-                    dropna=False
-                )
-                .max()
-                > 1
-            ):
-                conflicting_timestamps.append(
-                    str(timestamp)
-                )
-
-                if len(
-                    conflicting_timestamps
-                ) >= 20:
-                    break
-
-        if conflicting_timestamps:
-            raise ValueError(
-                "Conflicting duplicate timestamps across raw files: "
-                f"{conflicting_timestamps}"
-            )
-
-    combined = (
-        combined
-        .drop_duplicates(
-            subset=["timestamp_utc"],
-            keep="last",
-        )
-        .sort_values("timestamp_utc")
-        .reset_index(drop=True)
+    combined, exact_duplicate_rows = deduplicate_or_raise(
+        combined,
+        ["timestamp_utc"],
+        ignore_columns=["source_file", "timestamp_schema"],
+        dataset_name="area load",
     )
+    combined = combined.sort_values("timestamp_utc").reset_index(drop=True)
 
     final_columns = [
         "timestamp_utc",
@@ -819,8 +754,13 @@ def combine_area_load_files(
         "total_region_load_mw",
     ]
 
-    return (
+    clean = set_duplicate_stats(
         combined[final_columns],
+        exact_duplicate_rows=exact_duplicate_rows,
+    )
+
+    return (
+        clean,
         pd.DataFrame(file_summaries),
     )
 
@@ -837,7 +777,8 @@ def fill_missing_hourly_records(
     Role in the pipeline:
         This is the gap-filling stage, applied after combine_area_load_files()
         produces a merged but potentially incomplete timeline. Its output
-        feeds directly into audit_area_load() as the final candidate dataset.
+        feeds directly into extend_with_frozen_distribution() as the final
+        interior candidate dataset.
     """
     out = df.copy()
 
@@ -846,19 +787,11 @@ def fill_missing_hourly_records(
         utc=True,
     )
 
-    out = (
-        out
-        .sort_values("timestamp_utc")
-        .drop_duplicates(
-            subset=["timestamp_utc"],
-            keep="last",
-        )
-        .set_index("timestamp_utc")
-    )
+    duplicate_stats = out.attrs.get("preprocessing_duplicate_stats")
+    if out["timestamp_utc"].duplicated().any():
+        raise ValueError("Area load contains duplicate timestamps before filling.")
+    out = out.sort_values("timestamp_utc").set_index("timestamp_utc")
 
-    # Build a complete hourly UTC index from the first observed timestamp to
-    # the last. Any hour absent from the original data will appear in this
-    # index and can then be inserted through reindexing.
     complete_index = pd.date_range(
         start=out.index.min(),
         end=out.index.max(),
@@ -868,16 +801,10 @@ def fill_missing_hourly_records(
 
     original_index = out.index
 
-    # Reindexing aligns the DataFrame to the complete timeline. Existing rows
-    # retain their values, while previously missing timestamps are inserted
-    # as new rows containing NaN values.
     out = out.reindex(
         complete_index
     )
 
-    # isin identifies timestamps that existed before reindexing. The ~ operator
-    # reverses the boolean result, so newly inserted hours become True, and
-    # astype("int8") stores those flags efficiently as 1 and 0.
     out["area_load_imputed"] = (
         ~out.index.isin(original_index)
     ).astype("int8")
@@ -888,10 +815,6 @@ def fill_missing_hourly_records(
         if column.endswith("_load_mw")
     ]
 
-    # Time-based interpolation estimates missing values according to their
-    # position between surrounding timestamps. limit=1 permits only isolated
-    # one-hour gaps, while limit_area="inside" prevents filling missing values
-    # before the first observation or after the last one.
     out[load_columns] = (
         out[load_columns]
         .interpolate(
@@ -937,11 +860,126 @@ def fill_missing_hourly_records(
 
     out.index.name = "timestamp_utc"
 
-    return out.reset_index()
+    out = out.reset_index()
+    if duplicate_stats is not None:
+        out.attrs["preprocessing_duplicate_stats"] = duplicate_stats
+    return out
+
+
+def extend_with_frozen_distribution(
+    df: pd.DataFrame,
+    extend_to_utc: pd.Timestamp = EXTEND_END_UTC,
+) -> pd.DataFrame:
+    """
+    General purpose:
+        Extend the cleaned, gap-filled hourly timeline forward to
+        extend_to_utc by repeating the most recently observed area- and
+        region-level load values for every added hour. Because every
+        extended hour is a literal copy of the final observed row, the
+        regional load distribution (each region's share of total load) is
+        held frozen at its final observed state.
+
+    Role in the pipeline:
+        Applied after fill_missing_hourly_records() completes the interior
+        timeline. This guarantees area_load_preprocessed.parquet — and
+        everything downstream that depends on it (e.g.
+        load_weather_features.py, master_dataset.py) — reaches the
+        configured horizon rather than silently truncating wherever the raw
+        AESO area-load exports happen to end.
+    """
+    duplicate_stats = df.attrs.get("preprocessing_duplicate_stats")
+    out = df.copy()
+
+    out["timestamp_utc"] = pd.to_datetime(
+        out["timestamp_utc"],
+        utc=True,
+    )
+
+    out = (
+        out
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
+
+    out["area_load_frozen"] = 0
+
+    last_timestamp = out["timestamp_utc"].max()
+
+    if extend_to_utc <= last_timestamp:
+        return out
+
+    extension_index = pd.date_range(
+        start=last_timestamp + pd.Timedelta(hours=1),
+        end=extend_to_utc,
+        freq="h",
+        tz="UTC",
+    )
+
+    if len(extension_index) == 0:
+        return out
+
+    load_columns = [
+        *AREA_COLUMNS_CLEAN,
+        *REGION_COLUMNS_CLEAN,
+    ]
+
+    frozen_values = (
+        out
+        .loc[
+            out["timestamp_utc"].eq(last_timestamp),
+            load_columns,
+        ]
+        .iloc[0]
+    )
+
+    extension = pd.DataFrame(
+        {
+            column: frozen_values[column]
+            for column in load_columns
+        },
+        index=extension_index,
+    )
+
+    extension.index.name = "timestamp_utc"
+    extension = extension.reset_index()
+
+    extension["area_load_imputed"] = 1
+    extension["area_load_frozen"] = 1
+
+    combined = pd.concat(
+        [out, extension],
+        ignore_index=True,
+    )
+
+    combined["total_area_load_mw"] = (
+        combined[AREA_COLUMNS_CLEAN]
+        .sum(
+            axis=1,
+            min_count=1,
+        )
+    )
+
+    combined["total_region_load_mw"] = (
+        combined[REGION_COLUMNS_CLEAN]
+        .sum(
+            axis=1,
+            min_count=1,
+        )
+    )
+
+    combined = (
+        combined
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
+    if duplicate_stats is not None:
+        combined.attrs["preprocessing_duplicate_stats"] = duplicate_stats
+    return combined
 
 
 def load_and_clean_area_load(
     raw_dir: Path = RAW_DATA_DIR,
+    extend_to_utc: pd.Timestamp = EXTEND_END_UTC,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -949,17 +987,15 @@ def load_and_clean_area_load(
 ]:
     """
     General purpose:
-        Run the full discovery-through-gap-filling sequence in one call:
-        find raw files, clean and combine them, then fill timeline gaps.
+        Run the full discovery-through-extension sequence in one call: find
+        raw files, clean and combine them, fill interior timeline gaps, then
+        extend the timeline forward with a frozen regional distribution.
 
     Role in the pipeline:
         This is a convenience orchestrator used by process_area_load(). It
-        packages three separate stages into a single function call so the
+        packages four separate stages into a single function call so the
         top-level workflow doesn't need to sequence them itself.
     """
-    # The return annotation shows the order and type of all three outputs:
-    # the cleaned dataset, the per-file summary DataFrame, and the list of
-    # source-file Path objects that were discovered and processed.
     files = discover_raw_files(
         raw_dir
     )
@@ -972,6 +1008,11 @@ def load_and_clean_area_load(
 
     clean = fill_missing_hourly_records(
         clean
+    )
+
+    clean = extend_with_frozen_distribution(
+        clean,
+        extend_to_utc=extend_to_utc,
     )
 
     return (
@@ -989,10 +1030,10 @@ def audit_area_load(
 ]:
     """
     General purpose:
-        Run a full suite of validation checks against the cleaned, gap-filled
-        area-load data: timeline integrity, schema, missingness, value
-        ranges, imputation counts, and whether area-level and region-level
-        totals are mutually consistent.
+        Run a full suite of validation checks against the cleaned, gap-filled,
+        and horizon-extended area-load data: timeline integrity, schema,
+        missingness, value ranges, imputation/freeze counts, and whether
+        area-level and region-level totals are mutually consistent.
 
     Role in the pipeline:
         This is the quality-control gate between cleaning and saving. Its
@@ -1000,36 +1041,8 @@ def audit_area_load(
         allowed to write the cleaned data out as an approved product.
     """
     rows = []
-
-    def add(
-        check,
-        passed,
-        observed=None,
-        expected=None,
-        severity="error",
-        notes="",
-    ):
-        """
-        General purpose:
-            Append one standardized audit result (as a dict) to the shared
-            `rows` list, so every check is recorded in the same shape.
-
-        Role in the pipeline:
-            This is a local helper used only within audit_area_load(). It
-            keeps every individual check consistent so they can all be
-            converted into a single audit_df table at the end.
-        """
-        # These optional parameters provide sensible defaults for an audit
-        # result. A caller only needs to supply them when a check has a known
-        # expectation, a non-error severity, or additional explanatory notes.
-        rows.append({
-            "check": check,
-            "pass": bool(passed),
-            "severity": severity,
-            "observed": observed,
-            "expected": expected,
-            "notes": notes,
-        })
+    add = partial(add_check, rows)
+    add_duplicate_checks(rows, df)
 
     add(
         "timestamp_column_exists",
@@ -1160,10 +1173,6 @@ def audit_area_load(
     )
 
     if "area_load_imputed" in df.columns:
-        imputed_count = int(
-            df["area_load_imputed"].sum()
-        )
-
         invalid_flags = int(
             (
                 ~df["area_load_imputed"]
@@ -1178,15 +1187,60 @@ def audit_area_load(
             0,
         )
 
+        if "area_load_frozen" in df.columns:
+            interior_imputed_count = int(
+                df.loc[
+                    df["area_load_frozen"].eq(0),
+                    "area_load_imputed",
+                ].sum()
+            )
+        else:
+            interior_imputed_count = int(
+                df["area_load_imputed"].sum()
+            )
+
         add(
             "imputed_hour_count",
-            imputed_count == 10,
-            imputed_count,
+            interior_imputed_count == 10,
+            interior_imputed_count,
             10,
             severity="warning",
             notes=(
                 "Ten isolated hourly rows were inserted and linearly "
-                "interpolated, one in each year from 2011 through 2020."
+                "interpolated, one in each year from 2011 through 2020. "
+                "Excludes the trailing frozen-distribution extension."
+            ),
+        )
+
+    if "area_load_frozen" in df.columns:
+        invalid_frozen_flags = int(
+            (
+                ~df["area_load_frozen"]
+                .isin([0, 1])
+            ).sum()
+        )
+
+        add(
+            "frozen_flag_binary",
+            invalid_frozen_flags == 0,
+            invalid_frozen_flags,
+            0,
+        )
+
+        frozen_count = int(
+            df["area_load_frozen"].sum()
+        )
+
+        add(
+            "frozen_extension_hour_count",
+            True,
+            frozen_count,
+            "recorded",
+            severity="info",
+            notes=(
+                "Hours appended beyond the last AESO-observed reading, "
+                "with the regional load distribution held constant at its "
+                f"final observed values through {EXTEND_END_UTC}."
             ),
         )
 
@@ -1448,16 +1502,7 @@ def audit_area_load(
 
     audit_df = pd.DataFrame(rows)
 
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
-
-    audit_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    audit_pass = audit_passes(audit_df)
 
     return (
         audit_df,
@@ -1482,18 +1527,7 @@ def print_audit_report(
         pass/fail decision — it only surfaces what audit_area_load() found
         so a person can quickly review the health of the cleaned dataset.
     """
-    # The -> None annotation documents that this function does not return a
-    # value. Its purpose is to produce terminal output through print calls.
-    error_checks = audit_df.loc[
-        audit_df["severity"].eq("error"),
-        "pass",
-    ]
-
-    audit_pass = (
-        bool(error_checks.all())
-        if not error_checks.empty
-        else True
-    )
+    audit_pass = audit_passes(audit_df)
 
     failed = audit_df.loc[
         ~audit_df["pass"]
@@ -1523,6 +1557,14 @@ def print_audit_report(
         else 0
     )
 
+    frozen_hours = (
+        int(
+            clean["area_load_frozen"].sum()
+        )
+        if "area_load_frozen" in clean.columns
+        else 0
+    )
+
     print("\n" + "=" * 80)
     print("AREA LOAD AUDIT")
     print("=" * 80)
@@ -1539,6 +1581,7 @@ def print_audit_report(
         f"{len(clean) / expected_hours:.2%}"
     )
     print(f"Imputed hrs   : {imputed_hours:,}")
+    print(f"Frozen hrs    : {frozen_hours:,}")
 
     print("\nRaw files:")
     for path in files:
@@ -1605,7 +1648,8 @@ def process_area_load(
     """
     General purpose:
         Run the full area-load pipeline end-to-end: discover raw files,
-        clean and combine them, fill timeline gaps, audit the result, and
+        clean and combine them, fill timeline gaps, extend the timeline
+        forward with a frozen distribution, audit the result, and
         conditionally save the cleaned data and audit evidence.
 
     Role in the pipeline:
@@ -1613,15 +1657,25 @@ def process_area_load(
         whether to skip work (if outputs already exist), and only writes
         the final cleaned files if the audit's error-level checks pass.
     """
-    # overwrite defaults to False, so existing outputs are normally preserved.
-    # The function returns a dictionary containing the pipeline's status,
-    # output paths, summary metrics, or error information.
     start_time = time.perf_counter()
 
-    if (
-        OUTPUT_CSV.exists()
-        and OUTPUT_PARQUET.exists()
-        and not overwrite
+    raw_files = discover_raw_files()
+    expected_manifest = build_manifest(
+        dataset="area_load",
+        source_paths=raw_files,
+        code_paths=preprocessing_code_paths(Path(__file__)),
+        configuration={"extend_end_utc": str(EXTEND_END_UTC)},
+    )
+
+    if not overwrite and outputs_are_current(
+        [
+            OUTPUT_CSV,
+            OUTPUT_PARQUET,
+            AUDIT_FILE,
+            SUMMARY_FILE,
+            FILE_SUMMARY_FILE,
+        ],
+        expected_manifest,
     ):
         return {
             "dataset": "area_load",
@@ -1653,24 +1707,12 @@ def process_area_load(
             files,
         )
 
-        AUDIT_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        audit_df.to_csv(
-            AUDIT_FILE,
-            index=False,
-        )
-
-        summary_df.to_csv(
-            SUMMARY_FILE,
-            index=False,
-        )
-
-        file_summary.to_csv(
-            FILE_SUMMARY_FILE,
-            index=False,
+        write_audit_artifacts(
+            {
+                AUDIT_FILE: audit_df,
+                SUMMARY_FILE: summary_df,
+                FILE_SUMMARY_FILE: file_summary,
+            }
         )
 
         if not audit_pass:
@@ -1695,19 +1737,16 @@ def process_area_load(
                 ),
             }
 
-        PREPROCESSING_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        clean.to_csv(
-            OUTPUT_CSV,
-            index=False,
-        )
-
-        clean.to_parquet(
-            OUTPUT_PARQUET,
-            index=False,
+        write_tabular_outputs(
+            clean,
+            parquet_path=OUTPUT_PARQUET,
+            csv_path=OUTPUT_CSV,
+            manifest=expected_manifest,
+            provenance_artifacts=[
+                AUDIT_FILE,
+                SUMMARY_FILE,
+                FILE_SUMMARY_FILE,
+            ],
         )
 
         return {
@@ -1727,6 +1766,9 @@ def process_area_load(
             "raw_files": len(files),
             "imputed_hours": int(
                 clean["area_load_imputed"].sum()
+            ),
+            "frozen_hours": int(
+                clean["area_load_frozen"].sum()
             ),
             "csv_file": str(
                 OUTPUT_CSV
@@ -1748,6 +1790,17 @@ def process_area_load(
                 - start_time,
                 3,
             ),
+        }
+
+    except DuplicateConflictError as exc:
+        write_audit_artifacts({AUDIT_FILE: duplicate_failure_audit(exc)})
+        return {
+            "dataset": "area_load",
+            "status": "audit_failed",
+            "pass": False,
+            "error": str(exc),
+            "audit_file": str(AUDIT_FILE),
+            "processing_seconds": round(time.perf_counter() - start_time, 3),
         }
 
     except Exception as exc:
@@ -1803,8 +1856,5 @@ def main() -> None:
     print("=" * 80)
 
 
-# Python assigns the special variable __name__ the value "__main__" when
-# this file is executed directly. When another file imports it, __name__
-# instead contains the module name, so main() is not run automatically.
 if __name__ == "__main__":
     main()

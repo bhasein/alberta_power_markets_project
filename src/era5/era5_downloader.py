@@ -1,23 +1,36 @@
-from pathlib import Path
-from datetime import datetime
+"""Download and validate monthly ERA5 files required by the pipeline.
+
+Downloads use temporary ``.part`` files and are promoted only after the CDS
+request completes. Every month is validated before it is skipped, and a batch
+run fails with a nonzero exit status when any requested file remains invalid.
+"""
+
+from __future__ import annotations
+
+import argparse
 import calendar
+import sys
 import time
 import zipfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import cdsapi
+import pandas as pd
 import xarray as xr
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-PROJECT_ROOT = Path("/Users/brodiehasein/alberta_power_markets_project")
-
-ERA5_DIR = PROJECT_ROOT / "data/raw/weather/era5"
-SINGLE_DIR = ERA5_DIR / "single_levels"
-PRESSURE_DIR = ERA5_DIR / "pressure_levels"
-
-SINGLE_DIR.mkdir(parents=True, exist_ok=True)
-PRESSURE_DIR.mkdir(parents=True, exist_ok=True)
-
-ALBERTA_AREA = [60, -120.5, 48.5, -109]
+from config import (
+    ERA5_ALBERTA_AREA,
+    ERA5_PRESSURE_LEVEL_DIR as PRESSURE_DIR,
+    ERA5_SINGLE_LEVEL_DIR as SINGLE_DIR,
+    PIPELINE_END_MONTH,
+    PIPELINE_END_YEAR,
+    PIPELINE_START_YEAR,
+)
 
 
 SINGLE_LEVEL_VARIABLES = [
@@ -78,210 +91,255 @@ PRESSURE_REQUESTS = [
     },
 ]
 
+SINGLE_LEVEL_FILENAMES = {
+    "data_stream-oper_stepType-instant.nc",
+    "data_stream-oper_stepType-accum.nc",
+    "data_stream-oper_stepType-max.nc",
+}
+
 
 def days_for_month(year: int, month: int) -> list[str]:
-    return [f"{d:02d}" for d in range(1, calendar.monthrange(year, month)[1] + 1)]
+    """Return every valid day number for a calendar month."""
+
+    last_day = calendar.monthrange(year, month)[1]
+    return [f"{day:02d}" for day in range(1, last_day + 1)]
 
 
-def expected_hours(year: int, month: int) -> int:
-    return calendar.monthrange(year, month)[1] * 24
+def expected_timestamps(year: int, month: int) -> pd.DatetimeIndex:
+    """Return the exact hourly UTC timeline expected for a month."""
+
+    start = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
+    end = start + pd.offsets.MonthBegin(1)
+    return pd.date_range(start, end, freq="h", inclusive="left")
 
 
 def valid_nc(path: Path, year: int, month: int) -> bool:
+    """Return whether a NetCDF has the complete timeline for the named month."""
+
     if not path.exists() or path.stat().st_size == 0:
         return False
 
     try:
-        with xr.open_dataset(path, engine="netcdf4") as ds:
-            return ds.sizes.get("valid_time") == expected_hours(year, month)
-    except Exception:
+        with xr.open_dataset(path, engine="netcdf4") as dataset:
+            time_name = next(
+                (name for name in ("valid_time", "time") if name in dataset.coords),
+                None,
+            )
+            if time_name is None:
+                return False
+            observed = pd.DatetimeIndex(
+                pd.to_datetime(dataset[time_name].values, utc=True)
+            )
+            expected = expected_timestamps(year, month)
+            return observed.equals(expected)
+    except (OSError, ValueError, TypeError):
         return False
 
 
 def valid_single_folder(folder: Path, year: int, month: int) -> bool:
-    required_files = [
-        "data_stream-oper_stepType-instant.nc",
-        "data_stream-oper_stepType-accum.nc",
-        "data_stream-oper_stepType-max.nc",
-    ]
+    """Return whether all required single-level NetCDF files are valid."""
 
-    if not folder.exists():
-        return False
-
-    for file in required_files:
-        path = folder / file
-        if not valid_nc(path, year, month):
-            return False
-
-    return True
+    return folder.exists() and all(
+        valid_nc(folder / filename, year, month)
+        for filename in SINGLE_LEVEL_FILENAMES
+    )
 
 
 def valid_single_zip_or_folder(year: int, month: int) -> bool:
-    year_s = str(year)
-    month_s = f"{month:02d}"
+    """Validate an extracted single-level month, extracting its ZIP if needed."""
 
-    zip_path = SINGLE_DIR / f"era5_single_levels_alberta_{year_s}_{month_s}.zip"
-    folder = SINGLE_DIR / f"era5_single_levels_alberta_{year_s}_{month_s}"
+    period = f"{year}_{month:02d}"
+    zip_path = SINGLE_DIR / f"era5_single_levels_alberta_{period}.zip"
+    folder = SINGLE_DIR / f"era5_single_levels_alberta_{period}"
 
     if valid_single_folder(folder, year, month):
         return True
-
     if not zip_path.exists() or zip_path.stat().st_size == 0:
         return False
 
-    required = {
-        "data_stream-oper_stepType-instant.nc",
-        "data_stream-oper_stepType-accum.nc",
-        "data_stream-oper_stepType-max.nc",
-    }
-
     try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            names = set(z.namelist())
-            if not required.issubset(names):
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            if not SINGLE_LEVEL_FILENAMES.issubset(archive.namelist()):
                 return False
-
-            folder.mkdir(exist_ok=True)
-
-            for name in required:
-                out = folder / name
-                if not out.exists() or out.stat().st_size == 0:
-                    z.extract(name, folder)
-
+            folder.mkdir(parents=True, exist_ok=True)
+            for filename in SINGLE_LEVEL_FILENAMES:
+                archive.extract(filename, folder)
         return valid_single_folder(folder, year, month)
-
-    except Exception:
+    except (OSError, zipfile.BadZipFile):
         return False
 
 
-def download_to_part(client: cdsapi.Client, dataset: str, request: dict, output_file: Path) -> None:
-    part_file = output_file.with_suffix(output_file.suffix + ".part")
+def download_to_part(
+    client: cdsapi.Client,
+    dataset: str,
+    request: dict[str, Any],
+    output_file: Path,
+) -> None:
+    """Download one request atomically through a temporary partial file."""
 
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    part_file = output_file.with_suffix(output_file.suffix + ".part")
     if part_file.exists():
         part_file.unlink()
 
-    start = time.time()
+    started = time.perf_counter()
     print(f"[{datetime.now():%H:%M:%S}] Requesting {output_file.name}")
-
     client.retrieve(dataset, request).download(str(part_file))
+    part_file.replace(output_file)
 
-    part_file.rename(output_file)
-
-    elapsed = (time.time() - start) / 60
+    elapsed_minutes = (time.perf_counter() - started) / 60
     size_mb = output_file.stat().st_size / 1024**2
-
-    print(f"[{datetime.now():%H:%M:%S}] Saved {output_file.name} | {size_mb:.1f} MB | {elapsed:.1f} min")
+    print(
+        f"[{datetime.now():%H:%M:%S}] Saved {output_file.name} | "
+        f"{size_mb:.1f} MB | {elapsed_minutes:.1f} min"
+    )
 
 
 def download_single_levels(client: cdsapi.Client, year: int, month: int) -> None:
-    year_s = str(year)
-    month_s = f"{month:02d}"
+    """Download and validate one month of ERA5 single-level variables."""
 
-    output_file = SINGLE_DIR / f"era5_single_levels_alberta_{year_s}_{month_s}.zip"
-
+    period = f"{year}_{month:02d}"
+    output_file = SINGLE_DIR / f"era5_single_levels_alberta_{period}.zip"
     if valid_single_zip_or_folder(year, month):
-        print(f"Skipping existing single levels: {year_s}-{month_s}")
+        print(f"Skipping existing single levels: {year}-{month:02d}")
         return
-
     if output_file.exists():
-        print("Removing invalid/incomplete single zip:", output_file.name)
+        print(f"Removing invalid single-level archive: {output_file.name}")
         output_file.unlink()
 
     request = {
         "product_type": ["reanalysis"],
         "variable": SINGLE_LEVEL_VARIABLES,
-        "year": [year_s],
-        "month": [month_s],
+        "year": [str(year)],
+        "month": [f"{month:02d}"],
         "day": days_for_month(year, month),
-        "time": [f"{h:02d}:00" for h in range(24)],
-        "area": ALBERTA_AREA,
+        "time": [f"{hour:02d}:00" for hour in range(24)],
+        "area": ERA5_ALBERTA_AREA,
         "data_format": "netcdf",
         "download_format": "unarchived",
     }
-
-    download_to_part(client, "reanalysis-era5-single-levels", request, output_file)
-
+    download_to_part(
+        client,
+        "reanalysis-era5-single-levels",
+        request,
+        output_file,
+    )
     if not valid_single_zip_or_folder(year, month):
-        raise RuntimeError(f"Downloaded single-level file failed validation: {output_file}")
+        raise RuntimeError(f"Single-level download failed validation: {output_file}")
 
 
-def download_pressure_file(client: cdsapi.Client, year: int, month: int, request_info: dict) -> None:
-    year_s = str(year)
-    month_s = f"{month:02d}"
+def pressure_output_path(year: int, month: int, request_info: dict[str, Any]) -> Path:
+    """Return the canonical path for one monthly pressure-level request."""
 
-    output_file = PRESSURE_DIR / f"era5_pressure_{request_info['name']}_alberta_{year_s}_{month_s}.nc"
+    return PRESSURE_DIR / (
+        f"era5_pressure_{request_info['name']}_alberta_{year}_{month:02d}.nc"
+    )
 
+
+def download_pressure_file(
+    client: cdsapi.Client,
+    year: int,
+    month: int,
+    request_info: dict[str, Any],
+) -> None:
+    """Download and validate one monthly pressure-level file."""
+
+    output_file = pressure_output_path(year, month, request_info)
     if valid_nc(output_file, year, month):
-        print("Skipping existing pressure file:", output_file.name)
+        print(f"Skipping existing pressure file: {output_file.name}")
         return
-
     if output_file.exists():
-        print("Removing invalid/incomplete pressure file:", output_file.name)
+        print(f"Removing invalid pressure file: {output_file.name}")
         output_file.unlink()
 
     request = {
         "product_type": ["reanalysis"],
-        "year": [year_s],
-        "month": [month_s],
+        "year": [str(year)],
+        "month": [f"{month:02d}"],
         "day": days_for_month(year, month),
-        "time": [f"{h:02d}:00" for h in range(24)],
-        "area": ALBERTA_AREA,
+        "time": [f"{hour:02d}:00" for hour in range(24)],
+        "area": ERA5_ALBERTA_AREA,
         "data_format": "netcdf",
         "download_format": "unarchived",
         "pressure_level": request_info["pressure_level"],
         "variable": request_info["variable"],
     }
-
-    download_to_part(client, "reanalysis-era5-pressure-levels", request, output_file)
-
+    download_to_part(
+        client,
+        "reanalysis-era5-pressure-levels",
+        request,
+        output_file,
+    )
     if not valid_nc(output_file, year, month):
-        raise RuntimeError(f"Downloaded pressure file failed validation: {output_file}")
+        raise RuntimeError(f"Pressure-level download failed validation: {output_file}")
 
 
-def download_pressure_levels(client: cdsapi.Client, year: int, month: int) -> None:
-    for request_info in PRESSURE_REQUESTS:
-        download_pressure_file(client, year, month, request_info)
-        time.sleep(5)
+def download_month(client: cdsapi.Client, year: int, month: int) -> list[str]:
+    """Attempt every file for one month and return readable failure messages."""
 
-
-def download_month(client: cdsapi.Client, year: int, month: int) -> None:
-    print(f"\n{'=' * 70}")
-    print(f"Processing {year}-{month:02d}")
-    print(f"{'=' * 70}")
-
+    print(f"\n{'=' * 70}\nProcessing {year}-{month:02d}\n{'=' * 70}")
+    failures: list[str] = []
     try:
         download_single_levels(client, year, month)
-    except Exception as e:
-        print(f"FAILED single levels {year}-{month:02d}: {e}")
+    except Exception as exc:
+        failures.append(f"{year}-{month:02d} single levels: {exc}")
 
-    time.sleep(5)
+    for request_info in PRESSURE_REQUESTS:
+        try:
+            download_pressure_file(client, year, month, request_info)
+        except Exception as exc:
+            failures.append(
+                f"{year}-{month:02d} pressure {request_info['name']}: {exc}"
+            )
 
-    try:
-        download_pressure_levels(client, year, month)
-    except Exception as e:
-        print(f"FAILED pressure levels {year}-{month:02d}: {e}")
-
-    time.sleep(10)
+    for failure in failures:
+        print(f"FAILED {failure}")
+    return failures
 
 
-def download_range(start_year: int = 2015, end_year: int = 2026, end_month_by_year: dict | None = None) -> None:
-    if end_month_by_year is None:
-        end_month_by_year = {2026: 6}
+def download_range(
+    start_year: int = PIPELINE_START_YEAR,
+    end_year: int = PIPELINE_END_YEAR,
+    end_month: int = PIPELINE_END_MONTH,
+) -> list[str]:
+    """Download a year range and raise when any requested file fails."""
 
+    SINGLE_DIR.mkdir(parents=True, exist_ok=True)
+    PRESSURE_DIR.mkdir(parents=True, exist_ok=True)
     client = cdsapi.Client()
+    failures: list[str] = []
 
     for year in range(start_year, end_year + 1):
-        last_month = end_month_by_year.get(year, 12)
-
+        last_month = end_month if year == end_year else 12
         for month in range(1, last_month + 1):
-            download_month(client, year, month)
+            failures.extend(download_month(client, year, month))
 
-    print("\nAll downloads attempted.")
+    if failures:
+        details = "\n  - ".join(failures)
+        raise RuntimeError(
+            f"ERA5 download batch completed with {len(failures)} failures:\n  - "
+            f"{details}"
+        )
+    print("\nAll requested ERA5 downloads validated successfully.")
+    return failures
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for ERA5 acquisition."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start-year", type=int, default=PIPELINE_START_YEAR)
+    parser.add_argument("--end-year", type=int, default=PIPELINE_END_YEAR)
+    parser.add_argument("--end-month", type=int, default=PIPELINE_END_MONTH)
+    return parser
+
+
+def main() -> None:
+    """Run the configured ERA5 download batch from the command line."""
+
+    args = build_argument_parser().parse_args()
+    download_range(args.start_year, args.end_year, args.end_month)
 
 
 if __name__ == "__main__":
-    download_range(
-        start_year=2015,
-        end_year=2026,
-        end_month_by_year={2026: 6},
-    )
+    main()
