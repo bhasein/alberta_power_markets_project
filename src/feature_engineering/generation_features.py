@@ -20,17 +20,17 @@ Outputs
 -------
 Canonical feature output:
 
-    data/feature_engineering/generation/generation_features_hourly.parquet
+    data/features/generation/generation_features_hourly.parquet
 
 Optional full CSV output:
 
-    data/feature_engineering/generation/generation_features_hourly.csv
+    data/features/generation/generation_features_hourly.csv
 
 Audit outputs:
 
-    data/audits/feature_engineering/generation_features_audit_checks.csv
-    data/audits/feature_engineering/generation_features_feature_summary.csv
-    data/audits/feature_engineering/generation_features_source_summary.csv
+    data/audits/generation_features_audit_checks.csv
+    data/audits/generation_features_feature_summary.csv
+    data/audits/generation_features_source_summary.csv
 
 Run
 ---
@@ -62,9 +62,9 @@ outside a source's historical coverage remain missing and are identified
 with explicit source-availability flags.
 
 This file intentionally does not depend on market_features_hourly.parquet.
-It loads AIL directly from the preprocessed P&A table so that
-generation_features.py and market_features.py remain independent of each
-other and can be run in either order.
+It loads AIL directly from the raw P&A source so that generation_features.py
+and market_features.py remain independent of each other and can be run in
+either order.
 
 The file keeps feature logic modular. Add or remove functions from
 FEATURE_BUILDERS without changing the input/output pipeline.
@@ -94,61 +94,27 @@ import pandas as pd
 try:
     from .shared import (
         add_changes_through_current_hour as add_changes,
-        add_check,
         add_lags,
         add_prior_rolling_statistics as add_rolling_statistics,
-        apply_feature_builders as run_feature_builders,
-        audit_passed,
         build_manifest,
         classify_feature_timing,
-        configure_logging,
-        ensure_directories,
-        feature_code_paths,
         ensure_src_on_path,
-        existing_outputs_satisfy_request as outputs_satisfy_request,
-        find_first_column,
-        load_parquet_table,
-        merge_hourly_sources,
-        numeric_feature_summary,
-        numericize_except_timestamp,
         output_is_current,
-        read_existing_parquet,
         require_columns,
-        resolve_file,
         safe_divide,
-        save_feature_outputs as write_feature_outputs,
-        save_tables,
-        source_summary,
         write_manifest,
     )
 except ImportError:  # Support direct execution of this file.
     from shared import (
         add_changes_through_current_hour as add_changes,
-        add_check,
         add_lags,
         add_prior_rolling_statistics as add_rolling_statistics,
-        apply_feature_builders as run_feature_builders,
-        audit_passed,
         build_manifest,
         classify_feature_timing,
-        configure_logging,
-        ensure_directories,
-        feature_code_paths,
         ensure_src_on_path,
-        existing_outputs_satisfy_request as outputs_satisfy_request,
-        find_first_column,
-        load_parquet_table,
-        merge_hourly_sources,
-        numeric_feature_summary,
-        numericize_except_timestamp,
         output_is_current,
-        read_existing_parquet,
         require_columns,
-        resolve_file,
         safe_divide,
-        save_feature_outputs as write_feature_outputs,
-        save_tables,
-        source_summary,
         write_manifest,
     )
 
@@ -160,6 +126,27 @@ ensure_src_on_path(__file__)
 # ============================================================================
 
 LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging(
+    verbose: bool = False,
+) -> None:
+    """Configure console logging for the pipeline."""
+
+    logging.basicConfig(
+        level=(
+            logging.DEBUG
+            if verbose
+            else logging.INFO
+        ),
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
 
 
 # ============================================================================
@@ -281,6 +268,195 @@ NET_LOAD_ROLLING_WINDOWS = [3, 6, 24, 72, 168]
 # gas-fired steam split out in 2021, coal retired 2024, etc.) mean this will
 # not reconcile for every hour, which is why it is a warning-level check.
 GENERATION_RECONCILIATION_TOLERANCE_MW = 1.0
+
+
+# ============================================================================
+# General helpers
+# ============================================================================
+
+def ensure_output_directories() -> None:
+    """Create feature and audit output directories if needed."""
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    AUDIT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+def add_check(
+    rows: list[dict],
+    check: str,
+    passed: bool,
+    observed=None,
+    expected=None,
+    severity: str = "error",
+    notes: str = "",
+) -> None:
+    """Append one standardized audit result."""
+    rows.append(
+        {
+            "check": check,
+            "pass": bool(passed),
+            "severity": severity,
+            "observed": observed,
+            "expected": expected,
+            "notes": notes,
+        }
+    )
+
+
+def normalize_column_name(column: str) -> str:
+    """Normalize one source heading to snake case."""
+    return (
+        str(column)
+        .strip()
+        .lower()
+        .replace("\ufeff", "")
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("/", "_")
+    )
+
+
+def normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with normalized column names."""
+    output = frame.copy()
+    output.columns = [
+        normalize_column_name(column)
+        for column in output.columns
+    ]
+    return output
+
+
+def resolve_file(
+    candidates: Iterable[Path],
+    dataset_name: str,
+) -> Path:
+    """Return the first available candidate input file."""
+    for path in candidates:
+        if path.exists():
+            LOGGER.info(
+                "Resolved %s input: %s",
+                dataset_name,
+                path,
+            )
+            return path
+
+    candidate_text = "\n".join(
+        f"  - {path}"
+        for path in candidates
+    )
+
+    raise FileNotFoundError(
+        f"Could not find preprocessed {dataset_name} data. "
+        f"Checked:\n{candidate_text}"
+    )
+
+
+def find_first_column(
+    columns: Iterable[str],
+    candidates: Iterable[str],
+) -> str | None:
+    """Return the first candidate heading present in a collection."""
+    available = set(columns)
+
+    for candidate in candidates:
+        normalized = normalize_column_name(candidate)
+
+        if normalized in available:
+            return normalized
+
+    return None
+
+
+def load_parquet_table(
+    path: Path,
+    dataset_name: str,
+) -> pd.DataFrame:
+    """Load and standardize a timestamp-keyed Parquet source."""
+    LOGGER.info(
+        "Loading %s data from %s.",
+        dataset_name,
+        path,
+    )
+
+    frame = normalize_columns(
+        pd.read_parquet(path)
+    )
+
+    timestamp_column = find_first_column(
+        frame.columns,
+        [
+            "timestamp_utc",
+            "timestamp",
+            "date_begin_gmt",
+            "datetime_utc",
+        ],
+    )
+
+    if timestamp_column is None:
+        raise ValueError(
+            f"{dataset_name} does not contain a recognizable UTC timestamp."
+        )
+
+    if timestamp_column != "timestamp_utc":
+        frame = frame.rename(
+            columns={
+                timestamp_column: "timestamp_utc",
+            }
+        )
+
+    frame["timestamp_utc"] = pd.to_datetime(
+        frame["timestamp_utc"],
+        utc=True,
+        errors="coerce",
+    )
+
+    invalid_timestamps = int(
+        frame["timestamp_utc"]
+        .isna()
+        .sum()
+    )
+
+    if invalid_timestamps:
+        raise ValueError(
+            f"{dataset_name} contains {invalid_timestamps} invalid timestamps."
+        )
+
+    frame = (
+        frame
+        .drop_duplicates(
+            subset=["timestamp_utc"],
+            keep="last",
+        )
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
+
+    return frame
+
+
+def numericize_except_timestamp(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Coerce non-key columns to numeric values."""
+    output = frame.copy()
+
+    for column in output.columns:
+        if column == "timestamp_utc":
+            continue
+
+        output[column] = pd.to_numeric(
+            output[column],
+            errors="coerce",
+        )
+
+    return output
 
 
 # ============================================================================
@@ -502,6 +678,21 @@ FEATURE_BUILDERS: list[
 ]
 
 
+def apply_feature_builders(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Apply registered feature builders in dependency order."""
+
+    output = frame.copy()
+
+    for builder in FEATURE_BUILDERS:
+        output = builder(
+            output
+        )
+
+    return output
+
+
 # ============================================================================
 # Merge and audit
 # ============================================================================
@@ -511,11 +702,68 @@ def merge_sources(
     ail: pd.DataFrame,
 ) -> pd.DataFrame:
     """Left-join AIL to the complete generation backbone."""
-    return merge_hourly_sources(
-        generation,
-        [ail],
-        ["generation_available", "ail_available"],
+    output = generation.copy()
+
+    output = output.merge(
+        ail,
+        on="timestamp_utc",
+        how="left",
+        validate="one_to_one",
     )
+
+    for flag in [
+        "generation_available",
+        "ail_available",
+    ]:
+        if flag not in output.columns:
+            output[flag] = 0
+
+        output[flag] = (
+            output[flag]
+            .fillna(0)
+            .astype("int8")
+        )
+
+    output = (
+        output
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
+
+    return output
+
+
+def source_summary(
+    name: str,
+    frame: pd.DataFrame,
+    path: Path,
+) -> dict:
+    """Summarize source coverage and hourly key integrity."""
+    timestamps = pd.DatetimeIndex(
+        frame["timestamp_utc"]
+    )
+
+    expected = pd.date_range(
+        timestamps.min(),
+        timestamps.max(),
+        freq="h",
+        tz="UTC",
+    )
+
+    return {
+        "source": name,
+        "path": str(path),
+        "rows": len(frame),
+        "columns": len(frame.columns),
+        "start_utc": str(timestamps.min()),
+        "end_utc": str(timestamps.max()),
+        "duplicate_timestamps": int(
+            timestamps.duplicated().sum()
+        ),
+        "missing_hours_within_source": len(
+            expected.difference(timestamps)
+        ),
+    }
 
 
 def audit_generation_features(
@@ -745,9 +993,58 @@ def audit_generation_features(
             ),
         )
 
-    summary = numeric_feature_summary(
-        frame,
-        timing_classifier=lambda column: classify_feature_timing(
+    numeric_columns = [
+        column
+        for column in frame.columns
+        if column != "timestamp_utc"
+        and pd.api.types.is_numeric_dtype(
+            frame[column]
+        )
+    ]
+
+    summary = (
+        frame[numeric_columns]
+        .describe(
+            percentiles=[
+                0.01,
+                0.25,
+                0.5,
+                0.75,
+                0.99,
+            ]
+        )
+        .T
+        .reset_index()
+        .rename(
+            columns={
+                "index": "feature",
+                "1%": "p01",
+                "50%": "median",
+                "99%": "p99",
+            }
+        )
+    )
+
+    summary["missing_count"] = (
+        frame[numeric_columns]
+        .isna()
+        .sum()
+        .values
+    )
+
+    summary["missing_pct"] = (
+        summary["missing_count"]
+        / len(frame)
+        * 100
+    )
+
+    summary["dtype"] = [
+        str(frame[column].dtype)
+        for column in numeric_columns
+    ]
+
+    summary["feature_timing"] = [
+        classify_feature_timing(
             column,
             target_derived_prefixes={
                 "net_load_mw_change_",
@@ -755,11 +1052,24 @@ def audit_generation_features(
                 "solar_share_of_load",
                 "renewable_share_of_load",
             },
-        ),
-    )
+        )
+        for column in numeric_columns
+    ]
 
     audit = pd.DataFrame(rows)
-    return audit, summary, audit_passed(audit)
+
+    error_checks = audit.loc[
+        audit["severity"].eq("error"),
+        "pass",
+    ]
+
+    passed = (
+        bool(error_checks.all())
+        if not error_checks.empty
+        else True
+    )
+
+    return audit, summary, passed
 
 
 def print_report(
@@ -802,6 +1112,130 @@ def print_report(
 
 
 # ============================================================================
+# Output helpers
+# ============================================================================
+
+def save_audit_outputs(
+    audit: pd.DataFrame,
+    feature_summary: pd.DataFrame,
+    source_summary_frame: pd.DataFrame,
+) -> None:
+    """Write all generation-feature audit and source-summary outputs."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing generation-feature audit checks to %s.",
+        AUDIT_FILE,
+    )
+
+    audit.to_csv(
+        AUDIT_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing generation-feature numeric summary to %s.",
+        FEATURE_SUMMARY_FILE,
+    )
+
+    feature_summary.to_csv(
+        FEATURE_SUMMARY_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing generation-feature source summary to %s.",
+        SOURCE_SUMMARY_FILE,
+    )
+
+    source_summary_frame.to_csv(
+        SOURCE_SUMMARY_FILE,
+        index=False,
+    )
+
+
+def save_feature_outputs(
+    frame: pd.DataFrame,
+    write_csv: bool,
+) -> None:
+    """Write canonical Parquet and optional CSV feature outputs."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing canonical generation-feature Parquet to %s.",
+        OUTPUT_PARQUET,
+    )
+
+    frame.to_parquet(
+        OUTPUT_PARQUET,
+        index=False,
+    )
+
+    if write_csv:
+        LOGGER.info(
+            "Writing optional generation-feature CSV to %s.",
+            OUTPUT_CSV,
+        )
+
+        frame.to_csv(
+            OUTPUT_CSV,
+            index=False,
+        )
+
+
+def existing_outputs_satisfy_request(
+    write_csv: bool,
+    expected_manifest: dict[str, Any],
+) -> bool:
+    """
+    Return True when every requested feature output already exists.
+
+    Parquet is always required. CSV is required only when write_csv=True.
+    """
+
+    parquet_exists = output_is_current(
+        OUTPUT_PARQUET,
+        expected_manifest,
+    )
+
+    csv_requirement_satisfied = (
+        OUTPUT_CSV.exists()
+        if write_csv
+        else True
+    )
+
+    return (
+        parquet_exists
+        and csv_requirement_satisfied
+    )
+
+
+def read_existing_parquet_for_csv() -> pd.DataFrame:
+    """
+    Load the canonical Parquet when only a missing CSV output is requested.
+    """
+
+    LOGGER.info(
+        "Loading existing generation-feature Parquet from %s.",
+        OUTPUT_PARQUET,
+    )
+
+    frame = pd.read_parquet(
+        OUTPUT_PARQUET
+    )
+
+    if "timestamp_utc" in frame.columns:
+        frame["timestamp_utc"] = pd.to_datetime(
+            frame["timestamp_utc"],
+            utc=True,
+        )
+
+    return frame
+
+
+# ============================================================================
 # Pipeline
 # ============================================================================
 
@@ -819,14 +1253,18 @@ def build_generation_features(
     LOGGER.debug("Feature output directory: %s", OUTPUT_DIR)
     LOGGER.debug("Audit output directory: %s", AUDIT_DIR)
 
-    ensure_directories(OUTPUT_DIR, AUDIT_DIR)
+    ensure_output_directories()
 
     generation_path = resolve_file(GENERATION_FILE_CANDIDATES, "generation")
     ail_path = resolve_file(PA_FILE_CANDIDATES, "P&A (AIL)")
     expected_manifest = build_manifest(
         dataset=DATASET_NAME,
         source_paths=[generation_path, ail_path],
-        code_paths=feature_code_paths(Path(__file__)),
+        code_paths=[
+            Path(__file__),
+            Path(__file__).with_name("shared.py"),
+            Path(__file__).parents[1] / "config.py",
+        ],
         configuration={
             "feature_information_policy": FEATURE_INFORMATION_POLICY,
             "net_load_lags": NET_LOAD_LAGS,
@@ -837,16 +1275,9 @@ def build_generation_features(
     # Skip only when all explicitly requested feature outputs already exist.
     if (
         not overwrite
-        and outputs_satisfy_request(
-            OUTPUT_PARQUET,
-            OUTPUT_CSV,
+        and existing_outputs_satisfy_request(
             write_csv=write_csv,
             expected_manifest=expected_manifest,
-            required_artifacts=[
-                AUDIT_FILE,
-                FEATURE_SUMMARY_FILE,
-                SOURCE_SUMMARY_FILE,
-            ],
         )
     ):
         LOGGER.info(
@@ -896,7 +1327,7 @@ def build_generation_features(
         and write_csv
         and not OUTPUT_CSV.exists()
     ):
-        frame = read_existing_parquet(OUTPUT_PARQUET)
+        frame = read_existing_parquet_for_csv()
 
         LOGGER.info(
             "Creating missing CSV from existing canonical Parquet."
@@ -906,7 +1337,6 @@ def build_generation_features(
             OUTPUT_CSV,
             index=False,
         )
-        write_manifest(OUTPUT_CSV, expected_manifest)
 
         return {
             "dataset": DATASET_NAME,
@@ -995,7 +1425,9 @@ def build_generation_features(
         len(FEATURE_BUILDERS),
     )
 
-    master = run_feature_builders(master, FEATURE_BUILDERS)
+    master = apply_feature_builders(
+        master
+    )
 
     LOGGER.info(
         "Generation feature table constructed with %s rows and %s columns.",
@@ -1018,17 +1450,10 @@ def build_generation_features(
     )
 
     # Audit files are retained even when the feature audit fails.
-    save_tables(
-        {
-            AUDIT_FILE: audit,
-            FEATURE_SUMMARY_FILE: feature_summary,
-            SOURCE_SUMMARY_FILE: source_summary_frame,
-        },
-        {
-            AUDIT_FILE: "generation-feature audit checks",
-            FEATURE_SUMMARY_FILE: "generation-feature numeric summary",
-            SOURCE_SUMMARY_FILE: "generation-feature source summary",
-        },
+    save_audit_outputs(
+        audit,
+        feature_summary,
+        source_summary_frame,
     )
 
     if not passed:
@@ -1067,16 +1492,10 @@ def build_generation_features(
     # Canonical feature outputs
     # ------------------------------------------------------------------------
 
-    write_feature_outputs(
+    save_feature_outputs(
         master,
-        OUTPUT_PARQUET,
-        OUTPUT_CSV,
-        write_csv,
-        "generation-feature",
-        manifest=expected_manifest,
+        write_csv=write_csv,
     )
-    for artifact in [AUDIT_FILE, FEATURE_SUMMARY_FILE, SOURCE_SUMMARY_FILE]:
-        write_manifest(artifact, expected_manifest)
     provenance_file = write_manifest(OUTPUT_PARQUET, expected_manifest)
 
     processing_seconds = round(

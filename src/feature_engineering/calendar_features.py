@@ -47,17 +47,17 @@ Outputs
 -------
 Canonical feature output:
 
-    data/feature_engineering/calendar/calendar_features_hourly.parquet
+    data/features/calendar/calendar_features_hourly.parquet
 
 Optional full CSV output:
 
-    data/feature_engineering/calendar/calendar_features_hourly.csv
+    data/features/calendar/calendar_features_hourly.csv
 
 Audit outputs:
 
-    data/audits/feature_engineering/calendar_features_audit_checks.csv
-    data/audits/feature_engineering/calendar_features_summary.csv
-    data/audits/feature_engineering/calendar_holiday_dates.csv
+    data/audits/calendar_features_audit_checks.csv
+    data/audits/calendar_features_summary.csv
+    data/audits/calendar_holiday_dates.csv
 
 Run
 ---
@@ -106,30 +106,16 @@ import pandas as pd
 
 try:
     from .shared import (
-        add_check,
         build_manifest,
-        configure_logging,
-        ensure_directories,
-        feature_code_paths,
         ensure_src_on_path,
-        existing_outputs_satisfy_request as outputs_satisfy_request,
         output_is_current,
-        save_feature_outputs as write_feature_outputs,
-        save_tables,
         write_manifest,
     )
 except ImportError:  # Support direct execution of this file.
     from shared import (
-        add_check,
         build_manifest,
-        configure_logging,
-        ensure_directories,
-        feature_code_paths,
         ensure_src_on_path,
-        existing_outputs_satisfy_request as outputs_satisfy_request,
         output_is_current,
-        save_feature_outputs as write_feature_outputs,
-        save_tables,
         write_manifest,
     )
 
@@ -150,6 +136,23 @@ except ImportError as exc:
 
 LOGGER = logging.getLogger(__name__)
 
+
+def configure_logging(verbose: bool = False) -> None:
+    """
+    Configure console logging for the pipeline.
+
+    INFO is used by default.
+
+    DEBUG can be enabled with the command-line --verbose flag.
+    """
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
 # ============================================================================
 # Project paths
 # ============================================================================
@@ -157,8 +160,6 @@ LOGGER = logging.getLogger(__name__)
 from config import (
     FEATURES_DIR,
     FEATURE_ENGINEERING_AUDITS_DIR,
-    PIPELINE_END_UTC,
-    PIPELINE_START_UTC,
     PROJECT_ROOT,
 )
 
@@ -207,8 +208,8 @@ HOLIDAY_DATES_FILE = (
 
 TIMEZONE = "America/Edmonton"
 
-DEFAULT_START_UTC = PIPELINE_START_UTC
-DEFAULT_END_UTC = PIPELINE_END_UTC
+DEFAULT_START_UTC = "2015-01-01 00:00:00+00:00"
+DEFAULT_END_UTC = "2026-06-30 23:00:00+00:00"
 
 DATASET_NAME = "calendar_features"
 FEATURE_INFORMATION_POLICY = "known_ahead"
@@ -308,6 +309,43 @@ REQUIRED_COLUMNS = [
 # ============================================================================
 # General helpers
 # ============================================================================
+
+def ensure_output_directories() -> None:
+    """Create feature and audit output directories if they do not exist."""
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    AUDIT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+def add_check(
+    rows: list[dict[str, Any]],
+    check: str,
+    passed: bool,
+    observed: Any = None,
+    expected: Any = None,
+    severity: str = "error",
+    notes: str = "",
+) -> None:
+    """Append one audit check."""
+
+    rows.append(
+        {
+            "check": check,
+            "pass": bool(passed),
+            "severity": severity,
+            "observed": observed,
+            "expected": expected,
+            "notes": notes,
+        }
+    )
+
 
 def parse_utc_timestamp(
     value: str | pd.Timestamp,
@@ -533,7 +571,6 @@ def build_alberta_holiday_table(
     ).dt.normalize()
 
     # Some dates can have multiple holiday names.
-    #
     # For example, an observed holiday could occur on the same day as another
     # holiday. Group rows by date, combine duplicate holiday names, sort them
     # alphabetically, and join them into a single string separated by " | ".
@@ -1812,6 +1849,105 @@ def print_pipeline_result(
 # Output helpers
 # ============================================================================
 
+def save_audit_outputs(
+    audit: pd.DataFrame,
+    summary: pd.DataFrame,
+    holiday_table: pd.DataFrame,
+) -> None:
+    """Write calendar audit and metadata tables."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing audit checks to %s.",
+        AUDIT_FILE,
+    )
+
+    audit.to_csv(
+        AUDIT_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing numeric summary to %s.",
+        SUMMARY_FILE,
+    )
+
+    summary.to_csv(
+        SUMMARY_FILE,
+        index=False,
+    )
+
+    LOGGER.info(
+        "Writing holiday-date table to %s.",
+        HOLIDAY_DATES_FILE,
+    )
+
+    holiday_table.to_csv(
+        HOLIDAY_DATES_FILE,
+        index=False,
+    )
+
+
+def save_feature_outputs(
+    calendar: pd.DataFrame,
+    write_csv: bool,
+) -> None:
+    """Write canonical Parquet and optional CSV feature outputs."""
+
+    ensure_output_directories()
+
+    LOGGER.info(
+        "Writing canonical calendar Parquet to %s.",
+        OUTPUT_PARQUET,
+    )
+
+    calendar.to_parquet(
+        OUTPUT_PARQUET,
+        index=False,
+    )
+
+    if write_csv:
+        LOGGER.info(
+            "Writing optional calendar CSV to %s.",
+            OUTPUT_CSV,
+        )
+
+        calendar.to_csv(
+            OUTPUT_CSV,
+            index=False,
+        )
+
+
+def existing_outputs_satisfy_request(
+    write_csv: bool,
+    expected_manifest: dict[str, Any],
+) -> bool:
+    """
+    Return True when all requested feature outputs already exist.
+
+    Parquet is always required.
+
+    CSV is required only when write_csv=True.
+    """
+
+    parquet_exists = output_is_current(
+        OUTPUT_PARQUET,
+        expected_manifest,
+    )
+
+    csv_requirement_satisfied = (
+        OUTPUT_CSV.exists()
+        if write_csv
+        else True
+    )
+
+    return (
+        parquet_exists
+        and csv_requirement_satisfied
+    )
+
+
 def read_existing_parquet_for_csv() -> pd.DataFrame:
     """
     Load an existing canonical Parquet file when only a missing CSV is needed.
@@ -1894,11 +2030,15 @@ def process_calendar_features(
         f"{expected_hour_count(start_utc, end_utc):,}",
     )
 
-    ensure_directories(OUTPUT_DIR, AUDIT_DIR)
+    ensure_output_directories()
     expected_manifest = build_manifest(
         dataset=DATASET_NAME,
         source_paths=[],
-        code_paths=feature_code_paths(Path(__file__)),
+        code_paths=[
+            Path(__file__),
+            Path(__file__).with_name("shared.py"),
+            Path(__file__).parents[1] / "config.py",
+        ],
         configuration={
             "feature_information_policy": FEATURE_INFORMATION_POLICY,
             "start_utc": str(start_utc),
@@ -1918,12 +2058,9 @@ def process_calendar_features(
     # the Parquet was produced during an earlier run.
     if (
         not overwrite
-        and outputs_satisfy_request(
-            OUTPUT_PARQUET,
-            OUTPUT_CSV,
+        and existing_outputs_satisfy_request(
             write_csv=write_csv,
             expected_manifest=expected_manifest,
-            required_artifacts=[AUDIT_FILE, SUMMARY_FILE, HOLIDAY_DATES_FILE],
         )
     ):
         LOGGER.info(
@@ -1988,7 +2125,6 @@ def process_calendar_features(
             OUTPUT_CSV,
             index=False,
         )
-        write_manifest(OUTPUT_CSV, expected_manifest)
 
         return {
             "dataset": DATASET_NAME,
@@ -2059,17 +2195,10 @@ def process_calendar_features(
     # Audit outputs are written regardless of whether the audit passes.
     #
     # This preserves the evidence needed to diagnose a failed pipeline run.
-    save_tables(
-        {
-            AUDIT_FILE: audit,
-            SUMMARY_FILE: summary,
-            HOLIDAY_DATES_FILE: holiday_table,
-        },
-        {
-            AUDIT_FILE: "calendar audit checks",
-            SUMMARY_FILE: "calendar numeric summary",
-            HOLIDAY_DATES_FILE: "calendar holiday-date table",
-        },
+    save_audit_outputs(
+        audit,
+        summary,
+        holiday_table,
     )
 
     if not audit_pass:
@@ -2102,16 +2231,10 @@ def process_calendar_features(
     # Feature output
     # ------------------------------------------------------------------------
 
-    write_feature_outputs(
+    save_feature_outputs(
         calendar,
-        OUTPUT_PARQUET,
-        OUTPUT_CSV,
-        write_csv,
-        "calendar-feature",
-        manifest=expected_manifest,
+        write_csv=write_csv,
     )
-    for artifact in [AUDIT_FILE, SUMMARY_FILE, HOLIDAY_DATES_FILE]:
-        write_manifest(artifact, expected_manifest)
     provenance_file = write_manifest(OUTPUT_PARQUET, expected_manifest)
 
     processing_seconds = round(

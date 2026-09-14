@@ -18,8 +18,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import config
-from preprocessing import area_load_preprocessing
-from preprocessing import area_load_preprocessing_v2
+from preprocessing.old import area_load_preprocessing_old
+from preprocessing.old import area_load_preprocessing_v2
 from preprocessing import era5_preprocessing
 from preprocessing import generation_preprocessing
 from preprocessing import intertie_capability_preprocessing
@@ -44,8 +44,8 @@ class PathContractTests(unittest.TestCase):
 
     def test_preprocessing_outputs_use_config_contract(self) -> None:
         expected = {
-            area_load_preprocessing.OUTPUT_CSV: config.AREA_LOAD_CSV,
-            area_load_preprocessing.OUTPUT_PARQUET: config.AREA_LOAD_PARQUET,
+            area_load_preprocessing_old.OUTPUT_CSV: config.AREA_LOAD_CSV,
+            area_load_preprocessing_old.OUTPUT_PARQUET: config.AREA_LOAD_PARQUET,
             area_load_preprocessing_v2.OUTPUT_CSV: config.REGIONAL_LOAD_CSV,
             area_load_preprocessing_v2.OUTPUT_PARQUET:
                 config.REGIONAL_LOAD_PARQUET,
@@ -159,15 +159,15 @@ class TransformationContractTests(unittest.TestCase):
             column: float(index + 1)
             for index, column in enumerate(
                 [
-                    *area_load_preprocessing.AREA_COLUMNS_CLEAN,
-                    *area_load_preprocessing.REGION_COLUMNS_CLEAN,
+                    *area_load_preprocessing_old.AREA_COLUMNS_CLEAN,
+                    *area_load_preprocessing_old.REGION_COLUMNS_CLEAN,
                 ]
             )
         }
         frame = pd.DataFrame(
             [{"timestamp_utc": timestamp, "area_load_imputed": 0, **values}]
         )
-        result = area_load_preprocessing.extend_with_frozen_distribution(
+        result = area_load_preprocessing_old.extend_with_frozen_distribution(
             frame,
             extend_to_utc=timestamp + pd.Timedelta(hours=2),
         )
@@ -224,7 +224,7 @@ class TransformationContractTests(unittest.TestCase):
                 "AREA6": [100.0],
                 **{
                     region: [100.0]
-                    for region in area_load_preprocessing.REGION_COLUMNS
+                    for region in area_load_preprocessing_old.REGION_COLUMNS
                 },
             }
             first = root / "first.csv"
@@ -234,7 +234,7 @@ class TransformationContractTests(unittest.TestCase):
             changed["AREA6"] = [101.0]
             pd.DataFrame(changed).to_csv(second, index=False)
             with self.assertRaises(DuplicateConflictError):
-                area_load_preprocessing.combine_area_load_files([first, second])
+                area_load_preprocessing_old.combine_area_load_files([first, second])
 
     def test_regional_load_v2_reshapes_long_source(self) -> None:
         rows = []
