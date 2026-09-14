@@ -41,7 +41,7 @@ also include the current observed hour; their names intentionally omit
 
 Input
 -----
-data/processed/preprocessing/area_load_preprocessed.parquet
+data/preprocessing/regional_load_preprocessed.parquet
 
 Required regional load columns:
     calgary_load_mw
@@ -55,8 +55,8 @@ Required regional load columns:
 
 Output
 ------
-data/processed/feature_engineering/weather/load_weather_features_hourly.parquet
-data/processed/feature_engineering/weather/load_weather_features_hourly.csv
+data/feature_engineering/weather/load_weather_features_hourly.parquet
+data/feature_engineering/weather/load_weather_features_hourly.csv
 data/audits/feature_engineering/load_region_weather_mapping.csv
 data/audits/feature_engineering/load_weather_features_monthly_summary.csv
 data/audits/feature_engineering/load_weather_features_audit_checks.csv
@@ -146,24 +146,22 @@ LOGGER = logging.getLogger(__name__)
 # ============================================================================
 
 from config import (
+    ERA5_MONTHLY_STANDARDIZED_DIR,
     PREPROCESSING_DIR,
     FEATURES_DIR,
     FEATURE_ENGINEERING_AUDITS_DIR,
     PROJECT_ROOT,
+    REGIONAL_LOAD_PARQUET,
 )
 
 
 ERA5_MONTHLY_DIR = (
-    PREPROCESSING_DIR
-    / "weather"
-    / "era5"
-    / "monthly_standardized"
+    ERA5_MONTHLY_STANDARDIZED_DIR
 )
 
 
 AREA_LOAD_FILE = (
-    PREPROCESSING_DIR
-    / "area_load_preprocessed.parquet"
+    REGIONAL_LOAD_PARQUET
 )
 
 
@@ -233,7 +231,7 @@ REGION_LOAD_COLUMNS = {
 }
 
 # Representative weather points for the six AESO regions.
-# A user-maintained file in data/processed/preprocessing overrides these values.
+# A user-maintained file in data/preprocessing overrides these values.
 DEFAULT_LOAD_REGIONS = pd.DataFrame(
     [
         {
@@ -1699,21 +1697,15 @@ def process_month(
     pd.DataFrame,
 ]:
     """Build and audit the load-weather base table for one ERA5 month."""
-    period = monthly_file_period(
-        path
-    )
+    period = monthly_file_period(path)
 
     started = time.perf_counter()
     audit_rows: list[dict] = []
 
-    with xr.open_dataset(
-        path
-    ) as ds:
+    with xr.open_dataset(path) as ds:
         timestamps = pd.DatetimeIndex(
             pd.to_datetime(
-                ds[
-                    "timestamp"
-                ].values,
+                ds["timestamp"].values,
                 utc=True,
             )
         )
@@ -1722,14 +1714,9 @@ def process_month(
             audit_rows,
             period,
             "expected_era5_hour_count",
-            len(timestamps)
-            == expected_month_hours(
-                period
-            ),
+            len(timestamps) == expected_month_hours(period),
             len(timestamps),
-            expected_month_hours(
-                period
-            ),
+            expected_month_hours(period),
         )
 
         add_check(
@@ -1737,11 +1724,7 @@ def process_month(
             period,
             "era5_timestamps_unique",
             timestamps.is_unique,
-            int(
-                timestamps
-                .duplicated()
-                .sum()
-            ),
+            int(timestamps.duplicated().sum()),
             0,
         )
 
@@ -1755,56 +1738,45 @@ def process_month(
         )
 
         monthly_load = hourly_load.loc[
-            hourly_load[
-                "timestamp_utc"
-            ].isin(
-                timestamps
-            )
+            hourly_load["timestamp_utc"].isin(timestamps)
         ].copy()
 
         monthly_load = (
             monthly_load
-            .sort_values(
-                "timestamp_utc"
-            )
-            .reset_index(
-                drop=True
-            )
+            .sort_values("timestamp_utc")
+            .reset_index(drop=True)
         )
 
-        # Months outside AESO area-load coverage are skipped cleanly.
-        # Months without complete AESO load coverage are skipped cleanly.
-        #
-        # This handles:
-        # - months entirely outside load coverage;
-        # - edge months with only partial load coverage, such as January 2025.
-        if len(monthly_load) != len(timestamps):
-            coverage_status = (
-                "skipped_no_load_coverage"
-                if monthly_load.empty
-                else "skipped_partial_load_coverage"
-            )
+        # Preserve the ERA5 row positions corresponding to retained timestamps.
+        # Complete months retain every row; partial boundary months retain only
+        # the hours for which AESO regional load is available.
+        era5_time_positions = np.arange(
+            len(timestamps),
+            dtype=int,
+        )
 
+        # Months entirely outside AESO area-load coverage are skipped cleanly.
+        if monthly_load.empty:
             add_check(
                 audit_rows,
                 period,
-                "aeso_complete_month_available",
+                "aeso_load_coverage_available",
                 True,
-                observed=len(monthly_load),
+                observed=0,
                 expected=(
-                    f"{len(timestamps)} rows required; "
-                    f"month skipped because complete load coverage is unavailable"
+                    "month skipped because no AESO load "
+                    "coverage is available"
                 ),
                 severity="info",
             )
 
             summary = {
                 "period": period,
-                "status": coverage_status,
+                "status": "skipped_no_load_coverage",
                 "pass": True,
                 "rows": 0,
                 "columns": 0,
-                "available_load_hours": len(monthly_load),
+                "available_load_hours": 0,
                 "expected_month_hours": len(timestamps),
                 "source_file": str(path),
                 "processing_seconds": round(
@@ -1819,29 +1791,55 @@ def process_month(
                 pd.DataFrame(audit_rows),
             )
 
+        # Boundary months may have valid load coverage for only part of the
+        # ERA5 month. Retain the exact timestamp intersection in both datasets.
+        if len(monthly_load) != len(timestamps):
+            original_hour_count = len(timestamps)
+
+            overlap_mask = timestamps.isin(
+                monthly_load["timestamp_utc"]
+            )
+
+            era5_time_positions = np.flatnonzero(
+                overlap_mask
+            )
+
+            timestamps = timestamps[
+                overlap_mask
+            ]
+
+            add_check(
+                audit_rows,
+                period,
+                "aeso_partial_month_overlap",
+                True,
+                observed=len(timestamps),
+                expected=(
+                    f"{original_hour_count} ERA5 hours; "
+                    f"{len(timestamps)} overlapping AESO "
+                    "load hours retained"
+                ),
+                severity="info",
+            )
+
         add_check(
             audit_rows,
             period,
             "aeso_load_hour_count_matches_era5",
-            len(monthly_load)
-            == len(timestamps),
+            len(monthly_load) == len(timestamps),
             len(monthly_load),
             len(timestamps),
         )
 
         load_timestamps = pd.DatetimeIndex(
-            monthly_load[
-                "timestamp_utc"
-            ]
+            monthly_load["timestamp_utc"]
         )
 
         add_check(
             audit_rows,
             period,
             "aeso_load_timestamps_match_era5",
-            load_timestamps.equals(
-                timestamps
-            ),
+            load_timestamps.equals(timestamps),
             observed=(
                 f"load_start={load_timestamps.min()}, "
                 f"load_end={load_timestamps.max()}"
@@ -1853,9 +1851,7 @@ def process_month(
         )
 
         share_columns = (
-            mapping[
-                "share_column"
-            ]
+            mapping["share_column"]
             .tolist()
         )
 
@@ -1911,10 +1907,16 @@ def process_month(
             expected=0,
         )
 
-        site_dataset = extract_load_region_sites(
-            ds,
-            mapping,
-        ).load()
+        site_dataset = (
+            extract_load_region_sites(
+                ds,
+                mapping,
+            )
+            .isel(
+                timestamp=era5_time_positions
+            )
+            .load()
+        )
 
     base = build_monthly_base_weather(
         timestamps=timestamps,
@@ -1927,8 +1929,7 @@ def process_month(
         audit_rows,
         period,
         "output_row_count",
-        len(base)
-        == len(timestamps),
+        len(base) == len(timestamps),
         len(base),
         len(timestamps),
     )
@@ -1976,8 +1977,7 @@ def process_month(
             ].sum()
         ),
         "processing_seconds": round(
-            time.perf_counter()
-            - started,
+            time.perf_counter() - started,
             3,
         ),
         "source_file": str(path),

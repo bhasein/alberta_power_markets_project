@@ -36,6 +36,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import (
+    AESO_API_DATASET_PARQUET,
     CALENDAR_FEATURES,
     DATA_DIR,
     GENERATION_FEATURES,
@@ -74,6 +75,7 @@ SOURCE_FILES = {
     "generation": GENERATION_FEATURES,
     "load_weather": LOAD_WEATHER_FEATURES,
     "renewable_weather": RENEWABLE_WEATHER_FEATURES,
+    "aeso_api": AESO_API_DATASET_PARQUET,
 }
 
 MERGE_KEY = "timestamp_utc"

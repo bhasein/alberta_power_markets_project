@@ -20,11 +20,11 @@ Outputs
 -------
 Canonical feature output:
 
-    data/processed/feature_engineering/generation/generation_features_hourly.parquet
+    data/feature_engineering/generation/generation_features_hourly.parquet
 
 Optional full CSV output:
 
-    data/processed/feature_engineering/generation/generation_features_hourly.csv
+    data/feature_engineering/generation/generation_features_hourly.csv
 
 Audit outputs:
 

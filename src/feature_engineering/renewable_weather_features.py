@@ -57,7 +57,7 @@ solar
 
 Outputs
 -------
-data/processed/feature_engineering/weather/renewable_weather_features_hourly.parquet
+data/feature_engineering/weather/renewable_weather_features_hourly.parquet
 data/audits/feature_engineering/renewable_project_weather_mapping.csv
 data/audits/feature_engineering/weather_features_monthly_summary.csv
 data/audits/feature_engineering/weather_features_audit_checks.csv

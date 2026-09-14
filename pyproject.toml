@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alberta-power-markets"
 version = "0.1.0"
-description = "Audited hourly data pipeline for Alberta electricity-market analysis"
+description = "Audited Alberta electricity-market data pipeline and forecasting research program"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "cdsapi>=0.7.7",
+    "certifi>=2026.6.17",
     "holidays>=0.100",
     "netCDF4>=1.7.4",
     "numpy>=2.5.0",
@@ -19,10 +20,24 @@ dependencies = [
     "xarray>=2026.4.0",
 ]
 
+[project.optional-dependencies]
+analysis = [
+    "ipykernel>=7.3.0",
+    "ipython>=9.15.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.1",
+    "nbconvert>=7.17.1",
+    "scikit-learn>=1.9.0",
+]
+
 [project.scripts]
 alberta-power-pipeline = "run_pipeline:main"
 era5-download = "era5.era5_downloader:main"
 era5-progress = "era5.era5_download_progress:main"
+tigge-download = "tigge.tigge_downloader:main"
+aeso-download = "aeso_api.cli:main"
+aeso-api-preprocess = "preprocessing.aeso_api_preprocessing:main"
+regional-load-preprocess = "preprocessing.area_load_preprocessing_v2:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -30,3 +45,5 @@ py-modules = ["config", "pipeline_shared", "run_pipeline"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["aeso_api*", "era5*", "tigge*", "feature_engineering*", "preprocessing*"]
+namespaces = true

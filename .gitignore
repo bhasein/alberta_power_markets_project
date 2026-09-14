@@ -5,6 +5,7 @@
 venv/
 .venv/
 env/
+.direnv/
 
 # ---------------------------------------------------------------------
 # Python caches and tooling
@@ -15,8 +16,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.nox/
+.tox/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
 
 # ---------------------------------------------------------------------
@@ -24,6 +29,8 @@ htmlcov/
 # ---------------------------------------------------------------------
 
 .ipynb_checkpoints/
+*.nbconvert.ipynb
+.jupyter/
 
 # ---------------------------------------------------------------------
 # Python packaging / build artifacts
@@ -31,7 +38,10 @@ htmlcov/
 
 build/
 dist/
+.eggs/
+*.egg
 *.egg-info/
+wheels/
 
 # ---------------------------------------------------------------------
 # Project datasets and generated artifacts
@@ -46,12 +56,14 @@ data/
 .env
 .env.*
 !.env.example
+.cdsapirc
 
 # ---------------------------------------------------------------------
 # Editors and operating systems
 # ---------------------------------------------------------------------
 
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
 *.swp
@@ -62,3 +74,5 @@ data/
 # ---------------------------------------------------------------------
 
 .python-version
+*.log
+*.prof

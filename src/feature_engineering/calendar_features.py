@@ -47,11 +47,11 @@ Outputs
 -------
 Canonical feature output:
 
-    data/processed/feature_engineering/calendar/calendar_features_hourly.parquet
+    data/feature_engineering/calendar/calendar_features_hourly.parquet
 
 Optional full CSV output:
 
-    data/processed/feature_engineering/calendar/calendar_features_hourly.csv
+    data/feature_engineering/calendar/calendar_features_hourly.csv
 
 Audit outputs:
 

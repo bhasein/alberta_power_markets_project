@@ -13,7 +13,7 @@ WHY THIS FILE IS USEFUL:
     this file wires the whole pipeline together and reruns it top to bottom.
 
 PIPELINE ORDER:
-    Stage 1 - Preprocessing (raw -> data/processed/preprocessing)
+    Stage 1 - Preprocessing (raw -> data/preprocessing)
         era5_preprocessing        (slow; produces monthly NetCDFs used below)
         pa_preprocessing
         outages_preprocessing
@@ -21,9 +21,10 @@ PIPELINE ORDER:
         intertie_capability_preprocessing
         generation_preprocessing
         area_load_preprocessing
+        aeso_api_preprocessing
 
     Stage 2 - Feature engineering
-        (data/processed/preprocessing -> data/processed/feature_engineering)
+        (data/preprocessing -> data/feature_engineering)
         calendar_features          (no preprocessing dependency)
         market_features            (needs pa, interties_hour_ahead, outages)
         generation_features        (needs generation_by_fuel, pa)
@@ -84,6 +85,7 @@ from preprocessing import interties_hour_ahead_preprocessing
 from preprocessing import intertie_capability_preprocessing
 from preprocessing import generation_preprocessing
 from preprocessing import area_load_preprocessing
+from preprocessing import aeso_api_preprocessing
 from preprocessing import master_preprocessing
 
 from feature_engineering import calendar_features
@@ -96,6 +98,18 @@ from feature_engineering import renewable_weather_features
 # ============================================================================
 # Stage registry
 # ============================================================================
+
+def process_aeso_api_stage(overwrite: bool = False) -> dict[str, Any]:
+    """Adapt the multi-table AESO normalizer to the common stage contract."""
+
+    datasets = aeso_api_preprocessing.process_aeso_api(overwrite=overwrite)
+    return {
+        "dataset": "aeso_api",
+        "status": "saved_or_current",
+        "pass": True,
+        "tables": len(datasets),
+        "rows": sum(len(frame) for frame in datasets.values()),
+    }
 
 # Each stage is (name, callable). The callable must accept overwrite=bool
 # and return a result dict with at least a "pass" key, matching the pattern
@@ -118,6 +132,7 @@ STAGES: list[tuple[str, Callable[..., dict[str, Any]]]] = [
     ),
     ("generation", generation_preprocessing.process_generation),
     ("area_load", area_load_preprocessing.process_area_load),
+    ("aeso_api", process_aeso_api_stage),
 
     # ---- Stage 2: feature engineering ---------------------------------------
     ("calendar_features", calendar_features.process_calendar_features),
@@ -138,12 +153,14 @@ STAGE_DEPENDENCIES: dict[str, set[str]] = {
     "intertie_capability": set(),
     "generation": set(),
     "area_load": set(),
+    "aeso_api": set(),
     "calendar_features": set(),
     "market_features": {"pa", "outages", "interties_hour_ahead"},
     "generation_features": {"generation", "pa"},
     "load_weather_features": {"era5", "area_load"},
     "renewable_weather_features": {"era5"},
     "master": {
+        "aeso_api",
         "calendar_features",
         "market_features",
         "intertie_capability",
@@ -312,8 +329,8 @@ def run_pipeline(
 
         if name == "area_load" and result.get("pass", False):
             print(
-                "  Area load: 2024 observed data extended through "
-                "the end of 2025 using a frozen 2024 load distribution."
+                "  Regional load: legacy values retained through 2024; "
+                "observed AESO metered regional load used from 2025 onward."
             )
 
         if not result.get("pass", False) and not continue_on_failure:

@@ -20,6 +20,7 @@ if str(SRC_DIR) not in sys.path:
 
 import run_pipeline
 from era5 import era5_download_progress, era5_downloader
+from tigge import tigge_downloader
 
 
 class PipelineDependencyTests(unittest.TestCase):
@@ -29,6 +30,12 @@ class PipelineDependencyTests(unittest.TestCase):
         self.assertEqual(
             run_pipeline.expand_dependencies({"master"}),
             {name for name, _ in run_pipeline.STAGES},
+        )
+
+    def test_aeso_api_is_required_by_master(self) -> None:
+        self.assertIn(
+            "aeso_api",
+            run_pipeline.expand_dependencies({"master"}),
         )
 
     def test_only_runs_prerequisites_in_pipeline_order(self) -> None:
@@ -148,6 +155,90 @@ class Era5DownloadTests(unittest.TestCase):
         self.assertEqual(audit.loc[0, "single_files_present"], 3)
         self.assertEqual(audit.loc[0, "pressure_files_present"], 3)
         self.assertFalse(audit.loc[0, "month_complete"])
+
+
+class TiggeDownloadTests(unittest.TestCase):
+    """Verify the TIGGE request, vintage, and resumability contracts."""
+
+    def test_request_uses_alberta_domain_and_preserves_vintages(self) -> None:
+        request = tigge_downloader.single_level_request(
+            2024,
+            2,
+            tigge_downloader.SINGLE_LEVEL_REQUESTS[0],
+        )
+
+        self.assertEqual(request["area"], "60.0/-120.5/48.5/-109.0")
+        self.assertEqual(request["origin"], "ecmf")
+        self.assertEqual(request["type"], "cf")
+        self.assertEqual(request["time"], "00:00:00/12:00:00")
+        self.assertEqual(
+            request["step"],
+            "6/12/18/24/30/36/42/48/54/60/66/72",
+        )
+        self.assertEqual(request["date"], "2024-02-01/2024-02-29")
+        self.assertEqual(request["param"].split("/")[:4], [
+            "167", "168", "165", "166"
+        ])
+
+    def test_default_archive_begins_in_2020(self) -> None:
+        args = tigge_downloader.build_argument_parser().parse_args([])
+        self.assertEqual(args.start_year, 2020)
+
+    def test_valid_download_requires_matching_request_metadata(self) -> None:
+        request = tigge_downloader.base_request(2024, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.grib"
+            path.write_bytes(b"GRIB" + b"forecast-data" + b"7777")
+            tigge_downloader.write_metadata(path, request)
+
+            self.assertTrue(tigge_downloader.valid_download(path, request))
+            changed = {**request, "leadtime_hour": ["6"]}
+            self.assertFalse(tigge_downloader.valid_download(path, changed))
+
+    def test_dry_run_does_not_require_api_credentials(self) -> None:
+        with (
+            patch.object(tigge_downloader.cdsapi, "Client") as client,
+            patch.object(tigge_downloader, "SINGLE_DIR", Path("single")),
+            patch.object(tigge_downloader, "PRESSURE_DIR", Path("pressure")),
+            redirect_stdout(StringIO()),
+        ):
+            tigge_downloader.download_range(2024, 1, 2024, 1, dry_run=True)
+
+        client.assert_not_called()
+
+    def test_surface_only_attempts_two_monthly_requests(self) -> None:
+        with (
+            patch.object(tigge_downloader, "ensure_download") as ensure,
+            redirect_stdout(StringIO()),
+        ):
+            failures = tigge_downloader.download_month(
+                None,
+                2024,
+                1,
+                dry_run=True,
+                include_surface=True,
+                include_pressure=False,
+            )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(ensure.call_count, 2)
+
+    def test_pressure_only_attempts_three_monthly_requests(self) -> None:
+        with (
+            patch.object(tigge_downloader, "ensure_download") as ensure,
+            redirect_stdout(StringIO()),
+        ):
+            failures = tigge_downloader.download_month(
+                None,
+                2024,
+                1,
+                dry_run=True,
+                include_surface=False,
+                include_pressure=True,
+            )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(ensure.call_count, 3)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ if str(SRC_DIR) not in sys.path:
 
 import config
 from preprocessing import area_load_preprocessing
+from preprocessing import area_load_preprocessing_v2
 from preprocessing import era5_preprocessing
 from preprocessing import generation_preprocessing
 from preprocessing import intertie_capability_preprocessing
@@ -45,6 +46,9 @@ class PathContractTests(unittest.TestCase):
         expected = {
             area_load_preprocessing.OUTPUT_CSV: config.AREA_LOAD_CSV,
             area_load_preprocessing.OUTPUT_PARQUET: config.AREA_LOAD_PARQUET,
+            area_load_preprocessing_v2.OUTPUT_CSV: config.REGIONAL_LOAD_CSV,
+            area_load_preprocessing_v2.OUTPUT_PARQUET:
+                config.REGIONAL_LOAD_PARQUET,
             pa_preprocessing.OUTPUT_CSV: config.PA_TABLE_CSV,
             pa_preprocessing.OUTPUT_PARQUET: config.PA_TABLE_PARQUET,
             interties_hour_ahead_preprocessing.OUTPUT_CSV:
@@ -69,6 +73,12 @@ class PathContractTests(unittest.TestCase):
         self.assertEqual(
             master_preprocessing.SOURCE_FILES["generation"],
             config.GENERATION_FEATURES,
+        )
+
+    def test_master_consumes_hourly_aeso_api_dataset(self) -> None:
+        self.assertEqual(
+            master_preprocessing.SOURCE_FILES["aeso_api"],
+            config.AESO_API_DATASET_PARQUET,
         )
 
 
@@ -225,6 +235,69 @@ class TransformationContractTests(unittest.TestCase):
             pd.DataFrame(changed).to_csv(second, index=False)
             with self.assertRaises(DuplicateConflictError):
                 area_load_preprocessing.combine_area_load_files([first, second])
+
+    def test_regional_load_v2_reshapes_long_source(self) -> None:
+        rows = []
+        for region in [
+            *area_load_preprocessing_v2.REGIONS,
+            "Losses",
+            "System Load",
+        ]:
+            meter = 10.0 if region not in {"Losses", "System Load"} else 60.0
+            btf = 2.0 if region not in {"Losses", "System Load"} else np.nan
+            actual = meter + btf if pd.notna(btf) else np.nan
+            rows.append(
+                {
+                    "Region": region,
+                    "Date - MST": "01/01/2025 12:00:00 AM",
+                    "Date": "01/01/2025",
+                    "Date (MPT)": "01/01/2025 12:00:00 AM",
+                    "Date (MST)": "01/01/2025 12:00:00 AM",
+                    "Actual Load": actual,
+                    "BTF Load": btf,
+                    "Meter Load": meter,
+                }
+            )
+        clean = area_load_preprocessing_v2.clean_load_chart(pd.DataFrame(rows))
+        wide = area_load_preprocessing_v2.reshape_load_chart(clean)
+        self.assertEqual(len(wide), 1)
+        self.assertEqual(wide.loc[0, "calgary_meter_load_mw"], 10.0)
+        self.assertEqual(wide.loc[0, "total_meter_region_load_mw"], 60.0)
+        self.assertEqual(
+            wide.loc[0, "timestamp_utc"],
+            pd.Timestamp("2025-01-01 07:00:00", tz="UTC"),
+        )
+
+    def test_regional_load_v2_cutover_preserves_history(self) -> None:
+        historical_time = area_load_preprocessing_v2.CUTOVER_UTC - pd.Timedelta(hours=1)
+        recent_time = area_load_preprocessing_v2.CUTOVER_UTC
+        legacy = pd.DataFrame(
+            {
+                "timestamp_utc": [historical_time],
+                **{
+                    column: [100.0]
+                    for column in area_load_preprocessing_v2.CANONICAL_REGION_COLUMNS
+                },
+                "area_load_imputed": [0],
+            }
+        )
+        load_chart = pd.DataFrame(
+            {
+                "timestamp_utc": [historical_time, recent_time],
+                **{
+                    f"{slug}_meter_load_mw": [200.0, 300.0]
+                    for slug in area_load_preprocessing_v2.REGION_SLUGS.values()
+                },
+            }
+        )
+        result = area_load_preprocessing_v2.build_canonical_regional_load(
+            legacy, load_chart
+        )
+        self.assertEqual(result.loc[0, "calgary_load_mw"], 100.0)
+        self.assertEqual(result.loc[1, "calgary_load_mw"], 300.0)
+        self.assertEqual(
+            result.loc[1, "regional_load_source"], "load_chart_full_data"
+        )
 
 
 class Era5ContractTests(unittest.TestCase):

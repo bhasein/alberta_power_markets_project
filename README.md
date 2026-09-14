@@ -1,9 +1,10 @@
 # Alberta Power Markets Project
 
-An audited hourly data pipeline for Alberta electricity-market analysis. The
-project standardizes AESO market data and ERA5 weather data, creates
-model-ready features, and combines the approved products into one canonical
-UTC-indexed master dataset.
+An audited Alberta electricity-market data and forecasting research program.
+The project standardizes AESO market data and ERA5 weather data, creates
+model-ready features, combines approved products into one canonical
+UTC-indexed master dataset, and uses a staged notebook sequence to move from
+market structure and physical mechanisms toward out-of-sample forecasting.
 
 The pipeline is designed around four principles:
 
@@ -12,14 +13,20 @@ The pipeline is designed around four principles:
 - error-level audits must pass before canonical outputs are written;
 - provenance manifests determine whether an existing artifact is safe to reuse.
 
+The analytical notebooks follow the same evidence boundary as the pipeline:
+historical associations are not treated as causal effects, and realized
+weather, load, generation, or market outcomes are not presented as
+forecast-eligible inputs unless an information-available equivalent is defined.
+
 ## Quick Start
 
 Run these commands from the repository root.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+pip install -e . --no-deps
 ```
 
 Run the complete pipeline and reuse outputs whose data, code, configuration,
@@ -41,13 +48,38 @@ Run the regression suite:
 python -m unittest discover -s tests -v
 ```
 
-The validated local environment can also run these commands without activating
-the virtual environment:
+Launch the notebooks:
 
 ```bash
-./venv/bin/python src/run_pipeline.py --overwrite --write-csv
-./venv/bin/python -m unittest discover -s tests -v
+jupyter lab
 ```
+
+`requirements.txt` pins the validated pipeline and notebook environment.
+`pyproject.toml` provides compatible package constraints and an optional
+`analysis` dependency group.
+
+## Analysis Program
+
+The notebooks are organized by economic question so exploratory evidence,
+physical mechanisms, temporal structure, and forecast evaluation remain
+separate.
+
+| Notebook | Status | Role |
+| --- | --- | --- |
+| `01_Market_Orientation.ipynb` | Implemented | Structural transition, normal operation, and price regimes |
+| `02_Scarcity_Regimes_and_System_Tightness.ipynb` | Implemented | Available margin, thermal availability, outages, imports, and scarcity events |
+| `03_Fuel_Economics_and_Price_Formation.ipynb` | Implemented | Gas prices, reference fuel costs, and normal price formation |
+| `04_Weather_Demand_and_Renewable_Variability.ipynb` | Implemented | Temperature-driven demand, wind and solar availability, hydro limitations, and net-load formation |
+| `05_Temporal_Structure_and_Market_Memory.ipynb` | Implemented | Calendar effects, price persistence, volatility clustering, and event memory |
+| Notebook 6 — Baseline Forecast Models | Planned | Persistence, seasonal-naive, regression, and classification baselines |
+| Notebook 7 — Machine-Learning Forecast Models | Planned | Tree-based models, tuning, and calibration |
+| Notebook 8 — Price and Extreme-Event Forecasting | Planned | Final forecast systems and out-of-sample evaluation |
+| Notebook 9 — Market Applications | Planned | Decision-oriented and trading applications |
+
+Notebooks 1–4 are descriptive and pre-forecasting. They identify mechanisms,
+nonlinear relationships, stability, reporting limitations, and the appropriate
+forecast-time equivalent of each candidate variable. Notebooks 6–8 must use
+time-based validation and cannot treat same-hour realized outcomes as predictors.
 
 ## Required Local Data
 
@@ -58,18 +90,18 @@ pipeline, provide the AESO inputs expected by the preprocessing modules under
 Renewable-weather features also require these locally prepared project tables:
 
 ```text
-data/processed/preprocessing/wind_projects_preprocessed.csv
-data/processed/preprocessing/solar_projects_preprocessed.csv
+data/preprocessing/wind_projects_preprocessed.csv
+data/preprocessing/solar_projects_preprocessed.csv
 ```
 
 Those two tables are pipeline inputs but are not currently produced by a
 registered `run_pipeline.py` stage. An optional
-`data/processed/preprocessing/load_regions.csv` can override the built-in load
+`data/preprocessing/load_regions.csv` can override the built-in load
 region weather coordinates.
 
 ## Pipeline
 
-`src/run_pipeline.py` executes 13 stages in dependency order:
+`src/run_pipeline.py` executes 14 stages in dependency order:
 
 | Order | Stage | Main inputs | Main product |
 | ---: | --- | --- | --- |
@@ -79,13 +111,14 @@ region weather coordinates.
 | 4 | `interties_hour_ahead` | AESO intertie and forecast data | Hourly imports, exports, and hour-ahead price forecast |
 | 5 | `intertie_capability` | AESO ATC/TTC data | Hourly intertie capability |
 | 6 | `generation` | AESO generation-by-fuel data | Hourly generation, availability, and capacity by fuel |
-| 7 | `area_load` | AESO area-load workbooks | Hourly area and regional load |
-| 8 | `calendar_features` | Configured UTC range | Calendar, holiday, season, and cyclical features |
-| 9 | `market_features` | P&A, outages, and interties | Price, load, outage, and intertie features |
-| 10 | `generation_features` | Generation and P&A | Generation, capacity, share, and net-load features |
-| 11 | `load_weather_features` | Area load and standardized ERA5 | Load-weighted weather features |
-| 12 | `renewable_weather_features` | Wind/solar projects and standardized ERA5 | Capacity-weighted renewable-weather features |
-| 13 | `master` | All approved feature products | `master_hourly.parquet` |
+| 7 | `area_load` | Legacy area-load workbooks and the Load Chart export | Audited hourly regional load with observed 2025+ values |
+| 8 | `aeso_api` | Downloaded AESO API responses | Source-specific tables plus one merge-ready hourly API dataset |
+| 9 | `calendar_features` | Configured UTC range | Calendar, holiday, season, and cyclical features |
+| 10 | `market_features` | P&A, outages, and interties | Price, load, outage, and intertie features |
+| 11 | `generation_features` | Generation and P&A | Generation, capacity, share, and net-load features |
+| 12 | `load_weather_features` | Regional load and standardized ERA5 | Load-weighted weather features |
+| 13 | `renewable_weather_features` | Wind/solar projects and standardized ERA5 | Capacity-weighted renewable-weather features |
+| 14 | `master` | All approved feature products | `master_hourly.parquet` |
 
 ```mermaid
 flowchart LR
@@ -175,8 +208,61 @@ data/raw/weather/era5/
 Standardized monthly files are written under:
 
 ```text
-data/processed/preprocessing/weather/era5/monthly_standardized/
+data/preprocessing/era5_preprocessing/monthly_standardized/
 ```
+
+## TIGGE Forecast Acquisition
+
+`src/tigge/tigge_downloader.py` downloads historical ECMWF control forecasts
+from January 2020 onward for the Alberta ERA5 domain. This present-regime
+window avoids known losses in older TIGGE control/surface archives while
+retaining enough history for chronological validation. It retains the 00/12 UTC forecast origins and
+6–72 hour lead times, with two monthly surface files and three monthly
+pressure-level files (850, 700, and 500 hPa). Existing files are skipped only
+when both their GRIB structure and recorded request match.
+
+After accepting the TIGGE licence, place `ECMWF_API_KEY` in the ignored
+project-root `.env` file or configure the ECMWF Data Store API in
+`~/.cdsapirc`, then preview or run the complete archive with:
+
+```bash
+tigge-download --dry-run --start-year 2020 --end-year 2020 --end-month 1
+tigge-download
+```
+
+If ECMWF pressure-level archive tapes are temporarily unavailable, complete
+the surface archive first and retry the pressure archive later:
+
+```bash
+tigge-download --surface-only
+tigge-download --pressure-only
+```
+
+Raw files and exact-request metadata are written under
+`data/raw/weather/tigge/`. Forecast origin, lead time, and valid time must all
+be preserved during future preprocessing.
+
+## AESO API Acquisition and Preprocessing
+
+Authenticated AESO API downloads use `AESO_API_KEY` from the environment or
+the ignored project-root `.env` file. The core research download commands and
+timing limitations are documented in `src/aeso_api/README.md`.
+
+After downloading the selected API sources, normalize them with:
+
+```bash
+aeso-api-preprocess
+```
+
+The command writes source-specific Parquet datasets and
+`aeso_api_dataset_hourly.parquet` under `data/preprocessing/aeso_api/`, with
+quality, overlap, and forecast-eligibility registers under
+`data/audits/preprocessing/aeso_api/`. The hourly API dataset is merged into
+the canonical master with `aeso_`-prefixed columns. Duplicate actual-load and
+pool-price fields are retained only in the source-specific reconciliation
+tables and are excluded from the merge-ready dataset. Static asset and pool-
+participant snapshots also remain reference tables rather than being repeated
+across every master hour.
 
 ## Repository Layout
 
@@ -184,10 +270,11 @@ data/processed/preprocessing/weather/era5/monthly_standardized/
 .
 ├── data/
 │   ├── raw/                         # Original AESO, ERA5, and project inputs
-│   ├── processed/
-│   │   ├── preprocessing/           # Clean source-level hourly datasets
-│   │   ├── feature_engineering/     # Model-ready feature datasets
-│   │   └── master/                  # Canonical merged analytical dataset
+│   ├── preprocessing/               # Clean source-level hourly datasets
+│   │   ├── aeso_api/                # Normalized AESO API products
+│   │   └── era5_preprocessing/      # Standardized monthly ERA5 grids
+│   ├── feature_engineering/         # Model-ready feature datasets
+│   ├── master/                      # Canonical merged analytical dataset
 │   └── audits/
 │       ├── preprocessing/           # Source and ERA5 audit evidence
 │       ├── feature_engineering/     # Feature audit evidence and mappings
@@ -216,28 +303,28 @@ datasets must be obtained or recreated locally.
 Preprocessing products:
 
 ```text
-data/processed/preprocessing/pa_hourly_preprocessed.parquet
-data/processed/preprocessing/outages_preprocessed.parquet
-data/processed/preprocessing/interties_hour_ahead.parquet
-data/processed/preprocessing/intertie_capability.parquet
-data/processed/preprocessing/generation_by_fuel.parquet
-data/processed/preprocessing/area_load_preprocessed.parquet
+data/preprocessing/pa_hourly_preprocessed.parquet
+data/preprocessing/outages_preprocessed.parquet
+data/preprocessing/interties_hour_ahead.parquet
+data/preprocessing/intertie_capability.parquet
+data/preprocessing/generation_by_fuel.parquet
+data/preprocessing/regional_load_preprocessed.parquet
 ```
 
 Feature products:
 
 ```text
-data/processed/feature_engineering/calendar/calendar_features_hourly.parquet
-data/processed/feature_engineering/market/market_features_hourly.parquet
-data/processed/feature_engineering/generation/generation_features_hourly.parquet
-data/processed/feature_engineering/weather/load_weather_features_hourly.parquet
-data/processed/feature_engineering/weather/renewable_weather_features_hourly.parquet
+data/feature_engineering/calendar/calendar_features_hourly.parquet
+data/feature_engineering/market/market_features_hourly.parquet
+data/feature_engineering/generation/generation_features_hourly.parquet
+data/feature_engineering/weather/load_weather_features_hourly.parquet
+data/feature_engineering/weather/renewable_weather_features_hourly.parquet
 ```
 
 Final analytical product:
 
 ```text
-data/processed/master/master_hourly.parquet
+data/master/master_hourly.parquet
 ```
 
 Parquet is canonical. CSV representations are intended for inspection or
@@ -286,20 +373,20 @@ Important conventions:
   daylight-saving transitions correctly;
 - the configured calendar and ERA5 horizon is January 2015 through June 2026.
 
-## Area-Load Assumption
+## Regional-Load Source Contract
 
-Observed area-load distribution data ends in 2024. To support downstream 2025
-analysis, the pipeline intentionally extends the final 2024 distribution
-through the end of 2025.
+The canonical load-weather input is
+`data/preprocessing/regional_load_preprocessed.parquet`. The pipeline preserves
+the legacy six-region series through December 2024, then uses observed `Meter
+Load` from `Load Chart_Full Data_data.csv` beginning January 2025. This removes
+the former frozen-distribution extension without silently rewriting historical
+notebook inputs.
 
-Extended rows are explicitly identified by:
-
-- `area_load_imputed = 1`;
-- `area_load_frozen = 1`.
-
-This is an explicit modeling assumption, not observed 2025 distribution data.
-The implementation and regression test remain in place so the assumption cannot
-silently change.
+The new source's regional `Actual Load`, `BTF Load`, and `Meter Load` fields are
+retained as parallel diagnostics. Differences against the legacy source are
+recorded in `data/audits/preprocessing/regional_load_overlap_audit.csv`.
+The 42 planning-area fields remain a separate historical product; current
+load-weather feature engineering does not consume them.
 
 ## Testing
 
@@ -326,13 +413,21 @@ complete local datasets.
 
 ## Installing as a Package
 
-`pyproject.toml` defines the package, compatible dependencies, and three command
-line entry points. Install it in editable mode after installing the validated
-requirements:
+`pyproject.toml` defines the package, compatible dependencies, an optional
+analysis environment, and command-line entry points. For the exact
+validated environment, install the pinned requirements before installing the
+project in editable mode:
 
 ```bash
 pip install -r requirements.txt
 pip install -e . --no-deps
+```
+
+Alternatively, install compatible pipeline and notebook dependencies directly
+from the package metadata:
+
+```bash
+pip install -e ".[analysis]"
 ```
 
 The following commands then become available:
@@ -341,6 +436,10 @@ The following commands then become available:
 alberta-power-pipeline --overwrite --write-csv
 era5-download
 era5-progress
+tigge-download
+aeso-download --help
+aeso-api-preprocess
+regional-load-preprocess
 ```
 
 Direct `python src/...` commands remain fully supported.
