@@ -67,11 +67,11 @@ separate.
 | Notebook | Status | Role |
 | --- | --- | --- |
 | `01_Market_Orientation.ipynb` | Implemented | Structural transition, normal operation, and price regimes |
-| `02_Scarcity_Regimes_and_System_Tightness.ipynb` | Implemented | Available margin, thermal availability, outages, imports, and scarcity events |
-| `03_Fuel_Economics_and_Price_Formation.ipynb` | Implemented | Gas prices, reference fuel costs, and normal price formation |
-| `04_Weather_Demand_and_Renewable_Variability.ipynb` | Implemented | Temperature-driven demand, wind and solar availability, hydro limitations, and net-load formation |
-| `05_Temporal_Structure_and_Market_Memory.ipynb` | Implemented | Calendar effects, price persistence, volatility clustering, and event memory |
-| Notebook 6 — Baseline Forecast Models | Planned | Persistence, seasonal-naive, regression, and classification baselines |
+| `02_Scarcity_&_System_Tightness.ipynb` | Implemented | Available margin, thermal availability, outages, imports, and scarcity events |
+| `03_Fuel_Economics_&_Price_Formation.ipynb` | Implemented | Gas prices, reference fuel costs, and normal price formation |
+| `04_Weather_Demand_&_Renewables.ipynb` | Implemented | Temperature-driven demand, wind and solar availability, hydro limitations, and net-load formation |
+| `05_Temporal_Price_Dynamics.ipynb` | Implemented | Calendar effects, price persistence, volatility clustering, and event memory |
+| `06_Market_State_Modeling.ipynb` | Implemented | Chronological market-state models, feature validation, and structural stability |
 | Notebook 7 — Machine-Learning Forecast Models | Planned | Tree-based models, tuning, and calibration |
 | Notebook 8 — Price and Extreme-Event Forecasting | Planned | Final forecast systems and out-of-sample evaluation |
 | Notebook 9 — Market Applications | Planned | Decision-oriented and trading applications |
